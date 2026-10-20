@@ -1,0 +1,294 @@
+---
+title: "Top20Analysis"
+output: html_document
+---
+
+```{r}
+library(tidyverse, ggplot2)
+library(nflfastR)
+library(fuzzyjoin)
+
+all_plays <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/top20_pbp_efficiency.csv")
+```
+
+NFL Receiving Stats
+```{r}
+# 1. Calculate aggregated player stats for the 2023 regular season
+stats_2023 <- calculate_stats(
+  seasons = 2023, 
+  summary_level = "season", 
+  season_type = "REG"
+)
+
+# 2. Select the specific receiving columns and sort by receiving yards
+receiving_leaderboard <- stats_2023 %>%
+  select(
+    player_name,
+    recent_team,
+    receptions,
+    targets,
+    receiving_yards,
+    receiving_yards_after_catch
+  ) %>%
+  mutate(air_yds = receiving_yards - receiving_yards_after_catch,
+         air_ypr = air_yds/receptions,
+         comp_pct = receptions/targets) %>% 
+  arrange(desc(receiving_yards)) %>% 
+  slice_head(n = 20) %>% 
+  arrange(desc(air_ypr))
+
+# View the top receivers (matching Tyreek Hill, CeeDee Lamb, etc.)
+head(receiving_leaderboard)
+```
+
+```{r}
+t20_season_RTE_2023 <- all_plays %>% 
+  group_by(player_name, nfl_id) %>% 
+  summarize(
+    mRTE = mean(peak_frame_efficiency),
+    aRTE = mean(avg_play_efficiency),
+    avg_final_eff = mean(final_frame_efficiency),
+    routes_run = n()
+  ) %>% 
+  arrange(desc(avg_final_eff)) %>% 
+  ungroup() %>% 
+  mutate(player_abbr = case_when(
+      player_name == "Amari Cooper" ~ "A.Cooper",
+      player_name == "Brandon Aiyuk" ~ "B.Aiyuk",
+      player_name == "Justin Jefferson" ~ "J.Jefferson",
+      player_name == "George Pickens" ~ "G.Pickens",
+      player_name == "Mike Evans" ~ "M.Evans",
+      player_name == "DK Metcalf" ~ "D.Metcalf",
+      player_name == "Tyreek Hill" ~ "T.Hill",
+      player_name == "Devonta Smith" ~ "D.Smith",
+      player_name == "Nico Collins" ~ "N.Collins",
+      player_name == "AJ Brown" ~ "A.Brown",
+      player_name == "Chris Olave" ~ "C.Olave",
+      player_name == "DJ Moore" ~ "D.Moore",
+      player_name == "Puka Nacua" ~ "P.Nacua",
+      player_name == "CeeDee Lamb" ~ "C.Lamb",
+      player_name == "Davantae Adams" ~ "D.Adams",
+      player_name == "Keenan Allen" ~ "K.Allen",
+      player_name == "Stefon Diggs" ~ "S.Diggs",
+      player_name == "Amon-Ra St Brown" ~ "A.St. Brown",
+      player_name == "Jamarr Chase" ~ "J.Chase",
+      player_name == "Michael Pittman" ~ "M.Pittman",
+      TRUE ~ player_name
+    )
+  ) %>% 
+  left_join(receiving_leaderboard, by = c("player_abbr" = "player_name")) %>%
+  filter(!is.na(air_ypr)) %>% 
+  mutate(target_rate = targets/routes_run)
+```
+
+VIZUAL: mRTE and aRTE are effective in measuring a combination of downfield threat and space creation. 
+
+```{r}
+library(gt)
+library(dplyr)
+
+# 1. Define 2023 Min/Max scaling bounds
+mRTE_min <- min(t20_season_RTE_2023$mRTE, na.rm = TRUE)
+mRTE_max <- max(t20_season_RTE_2023$mRTE, na.rm = TRUE)
+
+aRTE_min <- min(t20_season_RTE_2023$aRTE, na.rm = TRUE)
+aRTE_max <- max(t20_season_RTE_2023$aRTE, na.rm = TRUE)
+
+eff_min  <- min(t20_season_RTE_2023$avg_final_eff, na.rm = TRUE)
+eff_max  <- max(t20_season_RTE_2023$avg_final_eff, na.rm = TRUE)
+
+# 2. Prepare 2023 data using the 2023 bounds
+gt_prep <- t20_season_RTE_2023 %>%
+  mutate(
+    mRTE_scaled          = (mRTE - mRTE_min) / (mRTE_max - mRTE_min) * 99,
+    aRTE_scaled          = (aRTE - aRTE_min) / (aRTE_max - aRTE_min) * 99,
+    avg_final_eff_scaled = (avg_final_eff - eff_min) / (eff_max - eff_min) * 99
+  ) %>%
+  select(
+    player_name,
+    recent_team,
+    mRTE = mRTE_scaled,
+    aRTE = aRTE_scaled,
+    avg_final_eff = avg_final_eff_scaled,
+    targets,
+    air_yds,
+    air_ypr,
+    comp_pct,
+    target_rate
+  )
+
+# 3. Construct 2023 GT Table
+gt_table <- gt_prep %>%
+  gt() %>%
+  tab_header(
+    title = md("**2023 Wide Receiver RTE & Opportunity Metrics**"),
+    subtitle = md("mRTE and aRTE relative scale (0–99) | Top 20 WRs by Rec Yards")
+  ) %>%
+  cols_label(
+    player_name = "Player",
+    recent_team = "Team",
+    mRTE = "mRTE",
+    aRTE = "aRTE",
+    avg_final_eff = "fRTE",
+    targets = "Targets",
+    air_yds = "Air Yards",
+    air_ypr = "Air YPR",
+    comp_pct = "Catch %",
+    target_rate = "Target Rate"
+  ) %>%
+  fmt_percent(columns = c(comp_pct, target_rate), decimals = 1) %>%
+  fmt_number(columns = c(mRTE, aRTE, avg_final_eff, air_ypr), decimals = 1) %>%
+  fmt_number(columns = c(targets, air_yds), decimals = 0) %>%
+  data_color(
+    columns = c(mRTE, aRTE, avg_final_eff),
+    palette = c("#D73027", "#FFFFBF", "#1A9850")
+  ) %>%
+  cols_align(align = "left", columns = c(player_name, recent_team)) %>%
+  cols_align(
+    align = "center",
+    columns = c(mRTE, aRTE, avg_final_eff, targets, air_yds, air_ypr, comp_pct, target_rate)
+  ) %>%
+  opt_row_striping() %>%
+  tab_options(
+    table.font.size = px(13),
+    heading.title.font.size = px(16),
+    column_labels.font.weight = "bold"
+  )
+
+gtsave(gt_table, filename = "receiver_RTE_table_2023.png")
+gt_table
+```
+
+Use 2023 RTE to predict 2024 Stats
+```{r}
+# 1. Calculate aggregated player stats for the 2024 regular season
+stats_2024 <- calculate_stats(
+  seasons = 2024, 
+  summary_level = "season", 
+  season_type = "REG"
+)
+
+# 2. Select receiving columns and apply the 100-target minimum filter
+receiving_leaderboard_2024 <- stats_2024 %>%
+  select(
+    player_name,
+    recent_team,
+    receptions,
+    targets,
+    receiving_yards,
+    receiving_yards_after_catch
+  ) %>%
+  filter(targets >= 100) %>% # Resolves cross-team abbreviation collisions
+  mutate(
+    air_yds = receiving_yards - receiving_yards_after_catch,
+    air_ypr = air_yds / receptions,
+    comp_pct = receptions / targets
+  ) %>% 
+  arrange(desc(receiving_yards))
+
+# 3. Summarize the tracking data and merge with the 2024 leaderboard
+t20_season_RTE_2024 <- all_plays %>% 
+  group_by(player_name, nfl_id) %>% 
+  summarize(
+    mRTE = mean(peak_frame_efficiency),
+    aRTE = mean(avg_play_efficiency),
+    avg_final_eff = mean(final_frame_efficiency),
+    routes_run = n(),
+    .groups = "drop" # Cleanly drops grouping structure to prevent downstream warnings
+  ) %>% 
+  arrange(desc(avg_final_eff)) %>% 
+  mutate(
+    player_abbr = case_when(
+      player_name == "Amari Cooper" ~ "A.Cooper",
+      player_name == "Brandon Aiyuk" ~ "B.Aiyuk",
+      player_name == "Justin Jefferson" ~ "J.Jefferson",
+      player_name == "George Pickens" ~ "G.Pickens",
+      player_name == "Mike Evans" ~ "M.Evans",
+      player_name == "DK Metcalf" ~ "D.Metcalf",
+      player_name == "Tyreek Hill" ~ "T.Hill",
+      player_name == "Devonta Smith" ~ "D.Smith",
+      player_name == "Nico Collins" ~ "N.Collins",
+      player_name == "AJ Brown" ~ "A.Brown",
+      player_name == "Chris Olave" ~ "C.Olave",
+      player_name == "DJ Moore" ~ "D.Moore",
+      player_name == "Puka Nacua" ~ "P.Nacua",
+      player_name == "CeeDee Lamb" ~ "C.Lamb",
+      player_name == "Davantae Adams" ~ "D.Adams",
+      player_name == "Keenan Allen" ~ "K.Allen",
+      player_name == "Stefon Diggs" ~ "S.Diggs",
+      player_name == "Amon-Ra St Brown" ~ "A.St. Brown",
+      player_name == "Jamarr Chase" ~ "J.Chase",
+      player_name == "Michael Pittman" ~ "M.Pittman",
+      TRUE ~ player_name
+    )
+  ) %>% 
+  # Execute the join on the pre-filtered 2024 target leaders
+  left_join(receiving_leaderboard_2024, by = c("player_abbr" = "player_name")) %>%
+  filter(!is.na(air_ypr)) %>% 
+  mutate(target_rate = targets / routes_run)
+```
+
+Forward-looking gt table using RTE as a predictor for future success
+```{r}
+# 1. Prepare 2024 data scaled against 2023 reference values
+gt_prep_2024 <- t20_season_RTE_2024 %>%
+  mutate(
+    # Min-max scaling anchored to 2023 population bounds
+    mRTE_scaled          = (mRTE - mRTE_min) / (mRTE_max - mRTE_min) * 99,
+    aRTE_scaled          = (aRTE - aRTE_min) / (aRTE_max - aRTE_min) * 99,
+    avg_final_eff_scaled = (avg_final_eff - eff_min) / (eff_max - eff_min) * 99
+  ) %>%
+  select(
+    player_name,
+    recent_team,
+    mRTE = mRTE_scaled,
+    aRTE = aRTE_scaled,
+    avg_final_eff = avg_final_eff_scaled,
+    targets,
+    air_yds,
+    air_ypr,
+    comp_pct,
+    target_rate
+  )
+
+# 2. Construct the 2024 GT Table
+gt_table_2024 <- gt_prep_2024 %>%
+  gt() %>%
+  tab_header(
+    title = md("**2023 Wide Receiver RTE & 2024 Opportunity Metrics**"),
+    subtitle = md("mRTE and aRTE relative scale (0–99 anchored to 2023) | 2023 Top 20 WRs, min 100 targets in 2024")
+  ) %>%
+  cols_label(
+    player_name = "Player",
+    recent_team = "Team",
+    mRTE = "mRTE",
+    aRTE = "aRTE",
+    avg_final_eff = "fRTE",
+    targets = "Targets",
+    air_yds = "Air Yards",
+    air_ypr = "Air YPR",
+    comp_pct = "Catch %",
+    target_rate = "Target Rate"
+  ) %>%
+  fmt_percent(columns = c(comp_pct, target_rate), decimals = 1) %>%
+  fmt_number(columns = c(mRTE, aRTE, avg_final_eff, air_ypr), decimals = 1) %>%
+  fmt_number(columns = c(targets, air_yds), decimals = 0) %>%
+  data_color(
+    columns = c(mRTE, aRTE, avg_final_eff),
+    palette = c("#D73027", "#FFFFBF", "#1A9850")
+  ) %>%
+  cols_align(align = "left", columns = c(player_name, recent_team)) %>%
+  cols_align(
+    align = "center",
+    columns = c(mRTE, aRTE, avg_final_eff, targets, air_yds, air_ypr, comp_pct, target_rate)
+  ) %>%
+  opt_row_striping() %>%
+  tab_options(
+    table.font.size = px(13),
+    heading.title.font.size = px(16),
+    column_labels.font.weight = "bold"
+  )
+
+gtsave(gt_table_2024, filename = "receiver_RTE_table_2024.png")
+gt_table_2024
+```

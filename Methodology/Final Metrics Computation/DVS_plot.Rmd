@@ -1,0 +1,138 @@
+---
+title: "DVS_plot"
+output: html_document
+---
+
+```{r}
+
+library(tidyverse)
+library(ggplot2)
+
+# 1. Load data
+full_df <- read_csv("~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/full_data.csv")
+all_grid <- read_csv("~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/Methodology/Final Metrics Computation/Mike_Evans_grid_cov_2games.csv")
+
+```
+
+```{r}
+
+game <- full_df %>%
+  filter(game_id == 2023091004)
+
+play <- game %>%
+  filter(play_description == "(1:14) (Shotgun) B.Mayfield pass deep middle to M.Evans for 28 yards, TOUCHDOWN.")
+
+play_description <- "(1:14) (Shotgun) B.Mayfield pass deep middle to M.Evans for 28 yards, TOUCHDOWN."
+
+# 2. Extract play metadata
+target_game <- 2023091004
+target_play <- 2177
+
+play_data <- full_df %>% 
+  filter(game_id == target_game, play_id == target_play)
+
+target_frame <- play_data %>%
+  filter(phase == "pre_pass") %>%
+  summarise(max_frame = max(frame_id, na.rm = TRUE)) %>%
+  pull(max_frame)
+
+# 2. Extract ball landing location
+# Checks for standardized vs raw ball land column names automatically
+ball_land <- play_data %>%
+  slice(1) %>%
+  mutate(
+    land_x = if ("ball_land_x_std" %in% names(.)) ball_land_x_std else ball_land_x,
+    land_y = if ("ball_land_y_std" %in% names(.)) ball_land_y_std else ball_land_y
+  )
+
+# 3. Surface Heatmap (Strict NA drop to clean gray border boundaries)
+static_surface <- all_grid %>% 
+  filter(
+    game_id == target_game, 
+    play_id == target_play, 
+    frame_id == target_frame, 
+    in_target_zone == TRUE,
+    !is.na(efficiency),
+    efficiency > 0
+  )
+
+# 4. Player tracking data
+static_players <- play_data %>% 
+  filter(
+    frame_id == target_frame,
+    (nfl_id == 41233 | tolower(player_role) == "passer" | tolower(player_side) == "defense")
+  ) %>% 
+  mutate(
+    player_side = tolower(player_side),
+    dir_rad = dir_std * pi / 180,
+    vx = s * sin(dir_rad),
+    vy = s * cos(dir_rad)
+  )
+
+# 5. Extract Line of Scrimmage & First Down Markers
+play_meta <- static_players %>% slice(1)
+los <- play_meta$los_x_std
+first_down <- los + play_meta$yards_to_go
+
+# 6. Render Field Plot
+p <- ggplot() +
+  # Turf & Field lines
+  annotate("rect", xmin = 0, xmax = 120, ymin = 0, ymax = 53.3, fill = "#1e7a3a") +
+  annotate("rect", xmin = 0, xmax = 10, ymin = 0, ymax = 53.3, fill = "#135c29") +
+  annotate("rect", xmin = 110, xmax = 120, ymin = 0, ymax = 53.3, fill = "#135c29") +
+  geom_vline(xintercept = seq(10, 110, by = 5), color = "white", alpha = 0.4) +
+  geom_vline(xintercept = seq(10, 110, by = 10), color = "white", linewidth = 0.8) +
+  
+  # Scrimmage & First Down
+  geom_vline(xintercept = los, color = "black", linewidth = 1.2) +
+  geom_vline(xintercept = first_down, color = "yellow", linewidth = 1.2) +
+  
+  # Coverage Efficiency Heatmap Layer (na.value hides background tiles)
+  geom_tile(data = static_surface, aes(x = x, y = y, fill = efficiency), alpha = 0.75) +
+  scale_fill_gradient2(
+    low = "white", mid = "lightpink", high = "#dc2626", 
+    midpoint = 0.25, limits = c(0, 0.5), name = "Route Threat\nEfficiency",
+    na.value = "transparent"
+  ) +
+  
+  # Ball Land Location Marker (Target / Pass Landing Point)
+  geom_point(data = ball_land, aes(x = land_x, y = land_y), shape = 4, size = 5, stroke = 2, color = "black") +
+  geom_point(data = ball_land, aes(x = land_x, y = land_y), shape = 4, size = 4, stroke = 1.2, color = "#f97316") +
+  
+  # Player Velocity Segments
+  geom_segment(
+    data = static_players,
+    aes(x = x_std, y = y_std, xend = x_std + vx * 1.5, yend = y_std + vy * 1.5, color = player_side),
+    arrow = arrow(length = unit(0.2, "cm")), linewidth = 1
+  ) +
+  
+  # Player Points
+  geom_point(data = static_players, aes(x = x_std, y = y_std), size = 4.5, color = "black") +
+  geom_point(data = static_players, aes(x = x_std, y = y_std, color = player_side), size = 3.2) +
+  scale_color_manual(values = c("offense" = "#facc15", "defense" = "#3b82f6"), name = "Side") +
+  
+  # Formatting
+  coord_fixed(xlim = c(0, 120), ylim = c(0, 53.3)) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    legend.position = "bottom"
+  ) +
+  labs(title = "Mike Evans Dangerous Viable Space at Time of Throw",
+       subtitle = paste0(play_description))
+
+p
+
+ggsave(
+  filename = "~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/Plots/Mike_Evans_TD_DVS_plot.png",
+  plot = p,
+  width = 8.5,
+  height = 7.5,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
+
+```

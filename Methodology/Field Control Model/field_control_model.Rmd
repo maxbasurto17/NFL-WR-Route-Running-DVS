@@ -1,0 +1,805 @@
+---
+title: "field_control_model"
+output: html_document
+---
+
+# Basic Libraries and Data
+
+```{r}
+
+library(tidyverse)
+
+# Tracking Data
+full_df <- read_csv("~/Documents/Football_R/CMSAC--Field Value/full_data.csv")
+
+```
+
+# Model
+
+```{r}
+
+library(dplyr)
+library(stats)
+
+# =============================================================================
+# SECTION 1 — TRACKING DATA PARSER (UPDATED FOR INDIVIDUAL KINEMATICS)
+# =============================================================================
+
+get_player_kinematic_bounds <- function(nfl_df) {
+  nfl_df %>%
+    filter(!is.na(nfl_id)) %>%
+    group_by(nfl_id) %>%
+    summarise(
+      vmax = quantile(s, probs = 0.95, na.rm = TRUE),
+      acceleration = quantile(a, probs = 0.95, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+extract_frame_data <- function(nfl_df, target_game, target_play, target_frame, player_bounds_df = NULL) {
+  # Calculate 95th percentile bounds across the provided dataset if not pre-supplied
+  if (is.null(player_bounds_df)) {
+    player_bounds_df <- get_player_kinematic_bounds(nfl_df)
+  }
+  
+  # Filter to target frame and join player kinematic bounds
+  frame_data <- nfl_df %>%
+    filter(game_id == target_game, play_id == target_play, frame_id == target_frame) %>%
+    filter(!is.na(nfl_id)) %>%
+    left_join(player_bounds_df, by = "nfl_id")
+  
+  frame_data <- frame_data %>%
+    mutate(
+      dir_rad = dir_std * pi / 180,
+      vx = s * sin(dir_rad),
+      vy = s * cos(dir_rad)
+    )
+  
+  offense_df <- frame_data %>% filter(player_side == "offense")
+  defense_df <- frame_data %>% filter(player_side == "defense")
+  
+  to_player_list <- function(df) {
+    lapply(1:nrow(df), function(i) {
+      list(
+        id           = df$nfl_id[i],
+        team         = df$player_side[i],
+        x            = df$x_std[i],
+        y            = df$y_std[i],
+        vx           = df$vx[i],
+        vy           = df$vy[i],
+        vmax         = df$vmax[i],         # 95th percentile speed
+        acceleration = df$acceleration[i]  # 95th percentile acceleration
+      )
+    })
+  }
+  
+  return(list(
+    attacking_players = to_player_list(offense_df),
+    defending_players = to_player_list(defense_df),
+    target_x          = frame_data$ball_land_x_std[1],
+    target_y          = frame_data$ball_land_y_std[1]
+  ))
+}
+
+# =============================================================================
+# SECTION 2 — KINEMATICS & BALL FLIGHT (PLAYER-SPECIFIC BOUNDS)
+# =============================================================================
+
+player_time_to_intercept <- function(player, target_x, target_y) {
+  # Use player-specific bounds stored in player object
+  vmax <- player$vmax
+  acceleration <- player$acceleration
+  
+  p0 <- c(player$x, player$y)
+  v0_vec <- c(player$vx, player$vy)
+  
+  dx <- target_x - p0[1]
+  dy <- target_y - p0[2]
+  
+  distances <- sqrt(dx^2 + dy^2)
+  distances[distances == 0 | is.na(distances)] <- 1e-8
+  
+  unit_x <- dx / distances
+  unit_y <- dy / distances
+  
+  v0_proj <- v0_vec[1] * unit_x + v0_vec[2] * unit_y
+  v0_proj <- pmin(v0_proj, vmax)
+  
+  t_acc <- (vmax - v0_proj) / acceleration
+  d_acc <- (v0_proj * t_acc) + (0.5 * acceleration * (t_acc^2))
+  
+  tti <- array(0, dim = dim(distances))
+  if (is.null(dim(distances))) tti <- numeric(length(distances))
+  
+  acc_phase_mask <- d_acc >= distances
+  acc_phase_mask[is.na(acc_phase_mask)] <- FALSE
+  
+  cruise_phase_mask <- !acc_phase_mask
+  cruise_phase_mask[is.na(cruise_phase_mask)] <- FALSE
+  
+  sqrt_term <- pmax(v0_proj^2 + 2 * acceleration * distances, 0)
+  
+  if (any(acc_phase_mask, na.rm = TRUE)) {
+    tti[acc_phase_mask] <- (-v0_proj[acc_phase_mask] + sqrt(sqrt_term[acc_phase_mask])) / acceleration
+  }
+  if (any(cruise_phase_mask, na.rm = TRUE)) {
+    d_cruise <- distances[cruise_phase_mask] - d_acc[cruise_phase_mask]
+    tti[cruise_phase_mask] <- t_acc[cruise_phase_mask] + (d_cruise / vmax)
+  }
+  return(tti)
+}
+
+estimate_nfl_pass_bounds <- function(distances, pass_speed_max = 23.0, pass_speed_min = 14.0) {
+  # Approximations for thrown footballs in yards
+  min_time <- distances / pass_speed_max 
+  max_time <- distances / pass_speed_min
+  return(list(min = pmax(min_time, 0.0), max = pmax(max_time, 0.0)))
+}
+
+football_travel_time <- function(qb_x, qb_y, target_x, target_y, attacking_players, pass_speed_max = 23.0, pass_speed_min = 14.0) {
+  dx <- target_x - qb_x
+  dy <- target_y - qb_y
+  distances <- sqrt(dx^2 + dy^2)
+  
+  bounds <- estimate_nfl_pass_bounds(distances, pass_speed_max, pass_speed_min)
+  
+  tti_shape <- dim(target_x)
+  if (is.null(tti_shape)) nearest_attacker_tti <- rep(Inf, length(target_x))
+  else nearest_attacker_tti <- array(Inf, dim = tti_shape)
+  
+  for (player in attacking_players) {
+    if (abs(player$x - qb_x) < 0.1 && abs(player$y - qb_y) < 0.1) next
+    
+    player_tti <- player_time_to_intercept(player, target_x, target_y)
+    nearest_attacker_tti <- pmin(nearest_attacker_tti, player_tti)
+  }
+  
+  selected_ball_time <- pmin(pmax(nearest_attacker_tti, bounds$min), bounds$max)
+  return(selected_ball_time)
+}
+
+arrival_probability <- function(t, tti, tti_sigma = 0.54) {
+  exponent <- -pi / sqrt(3.0) / tti_sigma * (t - tti)
+  exponent <- pmin(pmax(exponent, -50), 50)
+  return(1.0 / (1.0 + exp(exponent)))
+}
+
+control_rate <- function(t, tti, lambda_j = 3.99, tti_sigma = 0.54) {
+  P <- arrival_probability(t, tti, tti_sigma)
+  return(P * lambda_j)
+}
+
+# =============================================================================
+# SECTION 3 — PITCH CONTROL INTEGRATION
+# =============================================================================
+
+nfl_dynamic_pitch_control <- function(attacking_players, defending_players, qb_pos, grid_x, grid_y,
+                                       dt = 0.05, max_time = 8.0, lambda_att = 3.89, 
+                                       kappa = 1.18, tti_sigma = 0.67, 
+                                       pass_speed_max = 23.0, pass_speed_min = 14.0) {
+  
+  lambda_def <- lambda_att * kappa
+  
+  TTI_att <- lapply(attacking_players, function(p) player_time_to_intercept(p, grid_x, grid_y))
+  TTI_def <- lapply(defending_players, function(p) player_time_to_intercept(p, grid_x, grid_y))
+  
+  # Pass the parameterized speed limits into travel time function
+  T_ball <- football_travel_time(qb_pos$x, qb_pos$y, grid_x, grid_y, attacking_players, pass_speed_max, pass_speed_min)
+  
+  PPCF_att <- array(0.0, dim = dim(grid_x))
+  PPCF_def <- array(0.0, dim = dim(grid_x))
+  PPCF_tot <- array(0.0, dim = dim(grid_x))
+  
+  integration_times <- seq(0.0, max_time, by = dt)
+  
+  for (t in integration_times) {
+    active <- t >= T_ball
+    if (!any(active)) next
+    
+    calc_mask <- active & (PPCF_tot < 0.999)
+    if (!any(calc_mask)) next
+    
+    rate_att_cells <- lapply(TTI_att, function(tti_mat) control_rate(t, tti_mat[calc_mask], lambda_att, tti_sigma))
+    rate_def_cells <- lapply(TTI_def, function(tti_mat) control_rate(t, tti_mat[calc_mask], lambda_def, tti_sigma))
+    
+    rate_att <- if (length(rate_att_cells) > 0) Reduce("+", rate_att_cells) else 0.0
+    rate_def <- if (length(rate_def_cells) > 0) Reduce("+", rate_def_cells) else 0.0
+    
+    uncontrolled_prob <- 1.0 - PPCF_tot[calc_mask]
+    
+    dPPCF_att <- uncontrolled_prob * rate_att * dt
+    dPPCF_def <- uncontrolled_prob * rate_def * dt
+    
+    PPCF_att[calc_mask] <- PPCF_att[calc_mask] + dPPCF_att
+    PPCF_def[calc_mask] <- PPCF_def[calc_mask] + dPPCF_def
+    PPCF_tot[calc_mask] <- PPCF_tot[calc_mask] + dPPCF_att + dPPCF_def
+  }
+  
+  behind_qb_mask <- grid_x < qb_pos$x
+  PPCF_att[behind_qb_mask] <- 0.0
+  
+  return(list(PPCF_att = PPCF_att, PPCF_def = PPCF_def))
+}
+
+```
+
+# Optimizing Pitch Control Parameters
+
+```{r}
+library(rsample)
+library(pROC)
+# =============================================================================
+# 0. HELPER FUNCTIONS
+# =============================================================================
+
+# Calculate kinematic limits globally for the optimization pre-processing
+global_player_bounds <- get_player_kinematic_bounds(full_df)
+
+# Updated to map individual player bounds
+to_player_list <- function(df) {
+  if (nrow(df) == 0) return(list())
+  lapply(1:nrow(df), function(i) {
+    list(
+      id = df$nfl_id[i],
+      x = df$x_std[i],
+      y = df$y_std[i],
+      vx = df$vx[i],
+      vy = df$vy[i],
+      vmax = df$vmax[i],                 # Added from dynamic bounds
+      acceleration = df$acceleration[i]  # Added from dynamic bounds
+    )
+  })
+}
+
+# HYPER-OPTIMIZED PRE-PROCESSING FUNCTION (Updated for bounds_df)
+preprocess_tracking_data_fast <- function(pass_df, tracking_df, bounds_df) {
+  cat(sprintf("Pre-processing %d plays using fast inner_join...\n", nrow(pass_df)))
+  
+  # 1. Join ledger to tracking data and bind individual kinematics
+  relevant_tracking <- pass_df %>%
+    select(game_id, play_id, frame_id, y_true) %>%
+    inner_join(tracking_df, by = c("game_id", "play_id", "frame_id")) %>%
+    left_join(bounds_df, by = "nfl_id") %>%
+    mutate(
+      player_side = tolower(player_side),
+      dir_rad = dir_std * pi / 180,              
+      vx = s * sin(dir_rad),                     
+      vy = s * cos(dir_rad)                      
+    ) %>% 
+    filter(!is.na(x_std) & !is.na(y_std) & !is.na(vx) & !is.na(vy) & !is.na(vmax))
+  
+  # 2. Create grouping key and split into a list
+  relevant_tracking$unique_play_id <- paste(relevant_tracking$game_id, relevant_tracking$play_id, sep = "_")
+  plays_list <- split(relevant_tracking, relevant_tracking$unique_play_id)
+  
+  # 3. Format the list. 
+  formatted_list <- lapply(plays_list, function(play_df) {
+    
+    target_x <- play_df$ball_land_x_std[1]
+    target_y <- play_df$ball_land_y_std[1]
+    y_true   <- play_df$y_true[1]
+    
+    att_df <- play_df[play_df$player_side == "offense" & tolower(play_df$player_position) != "qb", ]
+    def_df <- play_df[play_df$player_side == "defense", ]
+    qb_df  <- play_df[tolower(play_df$player_position) == "qb", ]
+    
+    qb_pos <- if (nrow(qb_df) > 0) list(x = qb_df$x_std[1], y = qb_df$y_std[1]) else list(x = 60, y = 26.6)
+    
+    list(
+      att = to_player_list(att_df),
+      def = to_player_list(def_df),
+      qb = qb_pos,
+      target_x = target_x,
+      target_y = target_y,
+      y_true = y_true
+    )
+  })
+  
+  return(unname(formatted_list))
+}
+
+fast_compute_predictions <- function(params, preprocessed_list) {
+  l_att <- params[1]
+  k_def <- params[2]
+  s_tti <- params[3]
+  p_max <- params[4] # Optimized Max Pass Speed
+  p_min <- params[5] # Optimized Min Pass Speed
+  
+  n <- length(preprocessed_list)
+  preds <- numeric(n)
+  
+  for (i in seq_len(n)) {
+    item <- preprocessed_list[[i]]
+    
+    res <- tryCatch({
+      nfl_dynamic_pitch_control(
+        attacking_players = item$att,
+        defending_players = item$def,
+        qb_pos = item$qb,
+        grid_x = matrix(item$target_x),
+        grid_y = matrix(item$target_y),
+        lambda_att = l_att,
+        kappa = k_def,
+        tti_sigma = s_tti,
+        pass_speed_max = p_max,
+        pass_speed_min = p_min
+      )
+    }, error = function(e) {
+      print(e$message)
+      return(NULL)
+    })
+    
+    if (!is.null(res)) {
+      preds[i] <- pmin(pmax(res$PPCF_att[1], 1e-5), 1 - 1e-5)
+    } else {
+      preds[i] <- 0.5
+    }
+  }
+  return(preds)
+}
+
+fast_pitch_control_objective <- function(params, preprocessed_list) {
+  # Penalize invalid parameter boundaries, including max speed <= min speed
+  if (params[1] <= 0 | params[2] <= 0 | params[3] <= 0 | params[4] <= params[5]) return(1e6)
+  
+  preds <- fast_compute_predictions(params, preprocessed_list)
+  y_true <- sapply(preprocessed_list, function(x) x$y_true)
+  
+  log_loss <- -mean(y_true * log(preds) + (1 - y_true) * log(1 - preds))
+  
+  eval_count <<- eval_count + 1
+  cat(sprintf("Eval %3d | lam: %4.2f | kap: %4.2f | sig: %4.2f | vmax: %4.1f | vmin: %4.1f | Log-Loss: %.5f\n", 
+              eval_count, params[1], params[2], params[3], params[4], params[5], log_loss))
+  
+  return(log_loss)
+}
+
+# =============================================================================
+# 1. DATA PREPARATION & SPLIT
+# =============================================================================
+cat("Step 1: Filtering pass events and splitting data...\n")
+set.seed(42)
+
+# Create the play ledger
+pass_events <- full_df %>%
+  filter(
+    !is.na(ball_land_x_std), 
+    !is.na(ball_land_y_std),
+    pass_result %in% c("C", "I", "IN"),
+    phase == "pre_pass"
+  ) %>%
+  group_by(game_id, play_id) %>%
+  filter(frame_id == max(frame_id)) %>% 
+  ungroup() %>%
+  mutate(y_true = ifelse(pass_result == "C", 1, 0)) %>% 
+  select(game_id, play_id, frame_id, ball_land_x_std, ball_land_y_std, y_true) %>% 
+  distinct()
+
+data_split     <- initial_split(pass_events, prop = 0.80, strata = y_true)
+train_passes   <- training(data_split)
+holdout_passes <- testing(data_split)
+
+# =============================================================================
+# 2. PRE-PROCESS BOTH DATASETS
+# =============================================================================
+cat("\nStep 2: Pre-processing Training Set...\n")
+train_list <- preprocess_tracking_data_fast(train_passes, full_df, global_player_bounds)
+
+cat("\nStep 2b: Pre-processing Holdout Set...\n")
+holdout_list <- preprocess_tracking_data_fast(holdout_passes, full_df, global_player_bounds)
+
+# =============================================================================
+# 3. RUN OPTIMIZATION
+# =============================================================================
+cat("\nStep 3: Running Ultra-Fast Optimization on Training Data...\n")
+eval_count <<- 0
+
+# Include baseline approximations in baseline array
+spearman_baseline_params <- c(lambda_att = 3.89, kappa = 1.18, tti_sigma = 0.67, pass_speed_max = 23.0, pass_speed_min = 14.0)
+
+opt_results <- optim(
+  par = spearman_baseline_params,
+  fn = fast_pitch_control_objective,
+  preprocessed_list = train_list,
+  method = "L-BFGS-B",
+  # Added pass speed boundaries: [min_l, min_k, min_s, min_vmax, min_vmin]
+  lower = c(0.5, 0.5, 0.1, 18.0, 10.0), 
+  # Upper bounds: [max_l, max_k, max_s, max_vmax, max_vmin]
+  upper = c(10.0, 5.0, 2.0, 32.0, 17.5), 
+  control = list(trace = 1, maxit = 100)
+)
+
+optimized_nfl_params <- opt_results$par
+names(optimized_nfl_params) <- c("lambda_att", "kappa", "tti_sigma", "pass_speed_max", "pass_speed_min")
+
+saveRDS(optimized_nfl_params, "nfl_pitch_control_params.rds")
+cat("\nOptimization complete. Parameters saved to 'nfl_pitch_control_params.rds'\n")
+
+# =============================================================================
+# 4. VALIDATION ON HOLDOUT SET
+# =============================================================================
+cat("\nStep 4: Evaluating Out-of-Sample Performance...\n")
+y_holdout_true <- sapply(holdout_list, function(x) x$y_true)
+
+# Baseline Evaluation
+cat("Predicting baseline...\n")
+baseline_preds <- fast_compute_predictions(spearman_baseline_params, holdout_list)
+baseline_log_loss <- -mean(y_holdout_true * log(baseline_preds) + (1 - y_holdout_true) * log(1 - baseline_preds))
+baseline_auc <- auc(roc(y_holdout_true, baseline_preds, quiet = TRUE))
+
+# Optimized Evaluation
+cat("Predicting optimized...\n")
+nfl_preds <- fast_compute_predictions(optimized_nfl_params, holdout_list)
+nfl_log_loss <- -mean(y_holdout_true * log(nfl_preds) + (1 - y_holdout_true) * log(1 - nfl_preds))
+nfl_auc <- auc(roc(y_holdout_true, nfl_preds, quiet = TRUE))
+
+# =============================================================================
+# 5. RESULTS SUMMARY
+# =============================================================================
+results_table <- tibble::tribble(
+  ~Metric,                  ~`Spearman Baseline (Soccer)`, ~`Optimized NFL Model`,
+  "lambda_att",             as.character(spearman_baseline_params["lambda_att"]), sprintf("%.3f", optimized_nfl_params["lambda_att"]),
+  "kappa (def mult)",       as.character(spearman_baseline_params["kappa"]),      sprintf("%.3f", optimized_nfl_params["kappa"]),
+  "tti_sigma",              as.character(spearman_baseline_params["tti_sigma"]),  sprintf("%.3f", optimized_nfl_params["tti_sigma"]),
+  "pass_speed_max",         as.character(spearman_baseline_params["pass_speed_max"]), sprintf("%.3f", optimized_nfl_params["pass_speed_max"]),
+  "pass_speed_min",         as.character(spearman_baseline_params["pass_speed_min"]), sprintf("%.3f", optimized_nfl_params["pass_speed_min"]),
+  "Holdout Log-Loss",       sprintf("%.4f", baseline_log_loss),                  sprintf("%.4f", nfl_log_loss),
+  "Holdout ROC-AUC",        sprintf("%.4f", baseline_auc),                       sprintf("%.4f", nfl_auc)
+)
+
+print(results_table)
+```
+# Processing
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(gganimate)
+library(tidyr)
+library(future)
+library(furrr)
+
+# 1. SETUP PARALLEL PLAN
+num_workers <- max(1, availableCores() - 1)
+plan(multisession, workers = num_workers)
+
+temp_dir <- "play_results_temp"
+if (!dir.exists(temp_dir)) dir.create(temp_dir)
+
+# Load the parameters optimized in the previous chunk
+optimized_params <- readRDS("nfl_pitch_control_params.rds")
+
+# 2. RESTRUCTURED PROCESSING FUNCTION
+# Added opt_params argument to inject the optimized pass bounds and lambdas
+process_single_play <- function(play_data, output_dir, bounds_df, opt_params) {
+  
+  current_game_id <- play_data$game_id[1]
+  current_play_id <- play_data$play_id[1]
+  
+  play_processed <- play_data %>%
+    filter(!is.na(nfl_id), phase == "pre_pass") %>%
+    mutate(
+      player_side = tolower(player_side), 
+      dir_rad = dir_std * pi / 180, 
+      vx = s * sin(dir_rad),
+      vy = s * cos(dir_rad)
+    ) %>%
+    left_join(bounds_df, by = "nfl_id") %>%
+    filter(!is.na(x_std) & !is.na(y_std) & !is.na(vx) & !is.na(vy) & !is.na(vmax))
+  
+  if (nrow(play_processed) == 0) return(NULL)
+  
+  frames <- sort(unique(play_processed$frame_id))
+  grids <- build_nfl_grid(n_cols = 120, n_rows = 54)
+  xs <- seq(0, 120.0, length.out = 120)
+  ys <- seq(0, 53.3, length.out = 54)
+  grid_df_base <- expand.grid(y = ys, x = xs) 
+  
+  all_frames_ppcf <- list()
+  
+  for (f in frames) {
+    frame_data <- play_processed %>% filter(frame_id == f)
+    offense_df <- frame_data %>% filter(player_side == "offense")
+    defense_df <- frame_data %>% filter(player_side == "defense")
+    
+    to_player_list <- function(df) {
+      if(nrow(df) == 0) return(list())
+      lapply(1:nrow(df), function(i) {
+        list(
+          id = df$nfl_id[i], 
+          x = df$x_std[i], 
+          y = df$y_std[i], 
+          vx = df$vx[i], 
+          vy = df$vy[i],
+          vmax = df$vmax[i],                 
+          acceleration = df$acceleration[i]  
+        )
+      })
+    }
+    
+    qb_row <- offense_df %>% filter(tolower(player_position) == "qb") %>% slice(1)
+    if(nrow(qb_row) == 0) qb_row <- offense_df %>% slice(1) 
+    
+    if (nrow(qb_row) > 0) {
+      qb_pos <- list(x = qb_row$x_std, y = qb_row$y_std)
+      offense_df <- offense_df %>% filter(nfl_id != qb_row$nfl_id)
+    } else {
+      qb_pos <- list(x = 60, y = 26.6)
+    }
+    
+    attacking_players <- to_player_list(offense_df)
+    defending_players <- to_player_list(defense_df)
+    
+    if (length(attacking_players) == 0 || length(defending_players) == 0) next 
+    
+    results <- tryCatch({
+      # Inject the optimized variables into the frame calculation
+      nfl_dynamic_pitch_control(
+        attacking_players = attacking_players,
+        defending_players = defending_players,
+        qb_pos = qb_pos,
+        grid_x = grids$x,
+        grid_y = grids$y,
+        lambda_att = opt_params["lambda_att"],
+        kappa = opt_params["kappa"],
+        tti_sigma = opt_params["tti_sigma"],
+        pass_speed_max = opt_params["pass_speed_max"],
+        pass_speed_min = opt_params["pass_speed_min"]
+      )
+    }, error = function(e) {
+      return(NULL) 
+    })
+    
+    if (is.null(results)) next
+    
+    frame_surface <- grid_df_base
+    frame_surface$frame_id <- f
+    frame_surface$ppcf_att <- as.vector(results$PPCF_att) 
+    
+    all_frames_ppcf[[as.character(f)]] <- frame_surface
+  }
+  
+  if (length(all_frames_ppcf) == 0) return(NA_character_)
+  
+  surface_data <- bind_rows(all_frames_ppcf) %>%
+    mutate(game_id = current_game_id, play_id = current_play_id) %>%
+    group_by(game_id, play_id) %>%
+    filter(frame_id == max(frame_id)) %>%
+    ungroup()
+  
+  file_name <- file.path(output_dir, paste0("play_", current_game_id, "_", current_play_id, ".rds"))
+  saveRDS(surface_data, file_name)
+  
+  return(file_name)
+}
+
+# 3. EXECUTE PARALLEL MAPPING
+global_player_bounds <- get_player_kinematic_bounds(full_df)
+
+plays_list <- full_df %>%
+  group_by(game_id, play_id) %>%
+  group_split()
+
+message(sprintf("Processing %d plays across %d parallel workers...", length(plays_list), num_workers))
+
+# Pass optimized_params safely to the workers
+saved_files <- future_map_chr(
+  plays_list, 
+  ~ process_single_play(.x, temp_dir, bounds_df = global_player_bounds, opt_params = optimized_params),
+  .options = furrr_options(seed = TRUE),
+  .progress = TRUE
+)
+
+plan(sequential)
+
+# 4. LOAD FROM DISK AND COMBINE
+message("Loading chunked files from disk and combining...")
+
+saved_files <- saved_files[!is.na(saved_files)]
+all_rds_files <- list.files(temp_dir, pattern = "\\.rds$", full.names = TRUE)
+final_surface_data <- bind_rows(lapply(all_rds_files, readRDS))
+
+write.csv(final_surface_data, "field_control_data.csv", row.names = FALSE)
+message("Done! Final dataset saved to 'field_control_data.csv'.")
+```
+
+# Plot
+
+```{r}
+
+# =============================================================================
+# PLOT
+# =============================================================================
+
+plot_nfl_pitch_control_anim <- function(play_results) {
+  
+  surface_data <- play_results$surface_data
+  
+  # Filter out NAs based on the new standardized coordinate names
+  player_data <- play_results$player_data %>%
+    mutate(player_side = tolower(player_side)) %>%
+    filter(!is.na(x_std) & !is.na(y_std) & !is.na(vx) & !is.na(vy))
+  
+  ymin <- 0; ymax <- 53.3
+  xmin <- 0; xmax <- 120
+  
+  field_plot <- ggplot() +
+    annotate("rect", xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = "#1e7a3a") +
+    annotate("rect", xmin = 0, xmax = 10, ymin = ymin, ymax = ymax, fill = "#135c29") +
+    annotate("rect", xmin = 110, xmax = 120, ymin = ymin, ymax = ymax, fill = "#135c29") +
+    geom_vline(xintercept = seq(10, 110, by = 5), color = "white", alpha = 0.5) +
+    geom_vline(xintercept = seq(10, 110, by = 10), color = "white", linewidth = 1)
+  
+  animated_plot <- field_plot +
+    
+    # Pitch control tile surface (Keep x and y, as they come from the grid expand.grid)
+    geom_tile(
+      data = surface_data, 
+      aes(x = x, y = y, fill = ppcf_att), 
+      alpha = 0.65
+    ) +
+    scale_fill_gradient2(
+      low = "#1e40af", mid = "white", high = "#b91c1c", 
+      midpoint = 0.5, limits = c(0, 1), 
+      name = "Offense\nControl Prob"
+    ) +
+    
+    # Velocity Vectors (Update to x_std, y_std)
+    geom_segment(
+      data = player_data,
+      aes(
+        x = x_std, y = y_std, 
+        xend = x_std + vx * 0.5, yend = y_std + vy * 0.5,
+        color = player_side
+      ),
+      arrow = arrow(length = unit(0.1, "cm")), 
+      linewidth = 0.8 
+    ) +
+    
+    # Black borders for player dots (Update to x_std, y_std)
+    geom_point(
+      data = player_data, 
+      aes(x = x_std, y = y_std), 
+      size = 4, color = "black"
+    ) +
+    
+    # Colored inside for player dots (Update to x_std, y_std)
+    geom_point(
+      data = player_data, 
+      aes(x = x_std, y = y_std, color = player_side), 
+      size = 2.8 
+    ) +
+    
+    scale_color_manual(
+      values = c("offense" = "#facc15", "defense" = "#3b82f6"),
+      name = "Team"
+    ) +
+    
+    coord_fixed() +
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      legend.position = "bottom"
+    ) +
+    
+    labs(title = 'Frame: {frame_time}') +
+    transition_time(frame_id) +
+    ease_aes('linear')
+  
+  return(animated_plot)
+}
+
+# --- RENDER ---
+anim <- plot_nfl_pitch_control_anim(play_results)
+animate(anim, nframes = max(play_results$player_data$frame_id), fps = 10, width = 800, height = 400)
+
+```
+
+# Check completion % correlation
+```{r}
+play_data <- full_df %>% 
+  select(game_id, play_id, frame_id, ball_land_x_std, ball_land_y_std, pass_result) %>% 
+  distinct()
+
+completion_pct <- final_surface_data %>% 
+  left_join(
+    play_data, 
+    by = c("game_id", "play_id", "frame_id")
+  ) %>% 
+  mutate(distance_sq = (ball_land_x_std - x)^2 + (ball_land_y_std - y)^2) %>% 
+  group_by(game_id, play_id, frame_id) %>% 
+  slice_min(order_by = distance_sq, n = 1, with_ties = FALSE) %>% 
+  ungroup() %>%
+  mutate(distance = sqrt(distance_sq))
+
+# Load necessary libraries
+library(dplyr)
+library(rsample) # For data splitting
+library(caret)   # For confusion matrix and evaluation metrics
+
+# 1. Prepare the Data
+model_data <- completion_pct %>%
+  # Drop missing ppcf_att values
+  filter(!is.na(ppcf_att)) %>%
+  # Create binary outcome: 1 if "C" (Complete), 0 if "I" or "IN"
+  mutate(is_complete = ifelse(pass_result == "C", 1, 0)) %>%
+  select(is_complete, ppcf_att)
+
+# 2. Split Data (Standard 80/20 Split)
+set.seed(42)
+data_split <- initial_split(model_data, prop = 0.80)
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+# 3. Calculate Class Weights for the Training Set
+# We use inverse frequency weighting to give more weight to the minority class
+n_total <- nrow(train_data)
+n_pos <- sum(train_data$is_complete == 1)
+n_neg <- n_total - n_pos
+
+weight_pos <- n_total / (2 * n_pos)
+weight_neg <- n_total / (2 * n_neg)
+
+train_data <- train_data %>%
+  mutate(case_weight = ifelse(is_complete == 1, weight_pos, weight_neg))
+
+# 4. Train the Logistic Regression Model
+# Pass the calculated case_weight to the 'weights' argument
+log_model <- glm(
+  is_complete ~ ppcf_att, 
+  data = train_data, 
+  family = binomial(link = "logit"),
+  weights = case_weight
+)
+
+# View model summary
+summary(log_model)
+
+# 5. Predict on Test Set
+test_data$pred_prob <- predict(log_model, newdata = test_data, type = "response")
+
+# 6. Optimize Classification Threshold based on F1-Score
+# Function to calculate F1-score for a given threshold
+calculate_f1 <- function(probabilities, actuals, threshold) {
+  preds <- ifelse(probabilities >= threshold, 1, 0)
+  
+  # Handle edge cases where the model predicts only one class
+  if (sum(preds) == 0) return(0) 
+  
+  precision <- sum(preds == 1 & actuals == 1) / sum(preds == 1)
+  recall <- sum(preds == 1 & actuals == 1) / sum(actuals == 1)
+  
+  if (is.na(precision) || is.na(recall) || (precision + recall) == 0) return(0)
+  
+  f1 <- 2 * (precision * recall) / (precision + recall)
+  return(f1)
+}
+
+# Test thresholds from 0.10 to 0.90 in increments of 0.01
+thresholds <- seq(0.1, 0.9, by = 0.01)
+f1_scores <- sapply(thresholds, function(t) calculate_f1(test_data$pred_prob, test_data$is_complete, t))
+
+# Identify the best threshold
+best_index <- which.max(f1_scores)
+best_threshold <- thresholds[best_index]
+best_f1 <- f1_scores[best_index]
+
+cat("\nOptimization Results:\n")
+cat("Best Threshold:", best_threshold, "\n")
+cat("Maximum F1-Score:", best_f1, "\n\n")
+
+# 7. Apply the Best Threshold and Evaluate
+test_data$pred_class <- ifelse(test_data$pred_prob >= best_threshold, 1, 0)
+
+# Generate final Confusion Matrix using the optimized threshold
+conf_matrix <- confusionMatrix(
+  factor(test_data$pred_class, levels = c(0, 1)),
+  factor(test_data$is_complete, levels = c(0, 1)),
+  positive = "1"
+)
+
+print(conf_matrix)
+  
+```

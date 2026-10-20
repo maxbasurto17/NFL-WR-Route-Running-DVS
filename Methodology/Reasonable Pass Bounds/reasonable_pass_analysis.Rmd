@@ -1,0 +1,564 @@
+---
+title: "reasonable_pass_analysis"
+output: html_document
+---
+
+# Load Data and Libraries
+
+```{r}
+
+# Libraries
+library(tidyverse)
+
+# Data
+field_control <- read_csv("~/Documents/Sports Analytics/2026 CMSAC RRC/field_control_data.csv")
+main <- read_csv("~/Documents/Sports Analytics/2026 CMSAC RRC/full_data.csv")
+
+```
+# Cleaning
+
+```{r}
+
+# Select play id and pass info to merge with the field control data frame
+# Also keep targeted receiver info to understand where the receiver is located at the time of the throw
+pass_info <- main %>%
+  select(game_id, play_id, frame_id, phase, pass_result, ball_land_x_std, ball_land_y_std, los_x_std,
+         player_role, x_std, y_std) %>%
+  filter(player_role == "Targeted Receiver", phase == "pre_pass") %>%
+  group_by(game_id, play_id) %>%
+  filter(frame_id == max(frame_id)) %>%
+  ungroup()
+
+
+```
+
+# WR Location Analysis
+
+```{r}
+
+library(dplyr)
+library(quantreg)
+library(purrr)
+library(tidyr)
+library(ggplot2)
+
+# =============================================================================
+# 1. PREPARE DATA & TRAIN / TEST SPLIT (80% Train, 20% Test)
+# =============================================================================
+processed_data <- completed_pass_bounds %>%
+  mutate(
+    # Compute directional errors relative to the target receiver
+    err_x = ball_land_x_std - x_std,
+    err_y = ball_land_y_std - y_std,
+    abs_err_x = abs(err_x),
+    abs_err_y = abs(err_y)
+  )
+
+set.seed(42)
+train_idx  <- sample(seq_len(nrow(processed_data)), size = floor(0.80 * nrow(processed_data)))
+train_data <- processed_data[train_idx, ]
+test_data  <- processed_data[-train_idx, ]
+
+# =============================================================================
+# 2. DEFINE CANDIDATE SEQUENCES & PRE-COMPUTE PREDICTIONS
+# =============================================================================
+tau_x_cand <- seq(0.85, 0.995, by = 0.005)
+tau_y_cand <- seq(0.85, 0.995, by = 0.005)
+
+# Fit models ONCE on train data
+models_x <- map(tau_x_cand, ~ rq(abs_err_x ~ receiver_depth, tau = .x, data = train_data, method = "fn"))
+models_y <- map(tau_y_cand, ~ rq(abs_err_y ~ receiver_depth, tau = .x, data = train_data, method = "fn"))
+
+names(models_x) <- as.character(tau_x_cand)
+names(models_y) <- as.character(tau_y_cand)
+
+# Generate predictions for Train set
+preds_x_train <- map(models_x, ~ pmax(predict(.x, newdata = train_data), 0.1))
+preds_y_train <- map(models_y, ~ pmax(predict(.x, newdata = train_data), 0.1))
+
+# Generate predictions for Test set
+preds_x_test  <- map(models_x, ~ pmax(predict(.x, newdata = test_data), 0.1))
+preds_y_test  <- map(models_y, ~ pmax(predict(.x, newdata = test_data), 0.1))
+
+# =============================================================================
+# 3. EVALUATE ALL PAIRS ON TRAIN AND TEST SETS
+# =============================================================================
+tau_grid <- expand_grid(tau_x = tau_x_cand, tau_y = tau_y_cand)
+
+eval_grid <- map2_dfr(tau_grid$tau_x, tau_grid$tau_y, function(tx, ty) {
+  # --- Training Predictions & Metrics ---
+  rx_train <- preds_x_train[[as.character(tx)]]
+  ry_train <- preds_y_train[[as.character(ty)]]
+  in_ellipse_train <- ((train_data$err_x / rx_train)^2 + (train_data$err_y / ry_train)^2) <= 1.0
+  
+  # --- Testing Predictions & Metrics ---
+  rx_test  <- preds_x_test[[as.character(tx)]]
+  ry_test  <- preds_y_test[[as.character(ty)]]
+  in_ellipse_test  <- ((test_data$err_x / rx_test)^2 + (test_data$err_y / ry_test)^2) <= 1.0
+  
+  tibble(
+    tau_x = tx,
+    tau_y = ty,
+    
+    # IN-SAMPLE METRICS (Used for Decision Making)
+    train_coverage = mean(in_ellipse_train),
+    train_avg_area = mean(pi * rx_train * ry_train),
+    
+    # OUT-OF-SAMPLE METRICS (Used for Validation)
+    test_coverage  = mean(in_ellipse_test),
+    test_avg_area  = mean(pi * rx_test * ry_test)
+  )
+})
+
+# =============================================================================
+# 4. PARETO FRONTIER & SELECTION (BASED STRICTLY ON TRAIN METRICS)
+# =============================================================================
+pareto_frontier <- eval_grid %>%
+  arrange(train_avg_area) %>%
+  mutate(max_train_cov_so_far = cummax(train_coverage)) %>%
+  filter(train_coverage == max_train_cov_so_far) %>%
+  distinct(train_coverage, .keep_all = TRUE) %>%
+  mutate(
+    d_cov = train_coverage - lag(train_coverage),
+    d_area = train_avg_area - lag(train_avg_area),
+    train_efficiency = d_cov / d_area
+  )
+
+# Select optimal combination using TRAIN efficiency (Gated at >= 90% Train Coverage)
+best_gated_tau <- pareto_frontier %>%
+  filter(train_coverage >= 0.90) %>%
+  arrange(desc(train_efficiency)) %>%
+  slice(1)
+
+# Print comparison between Train selection and Test validation
+cat("--- OPTIMAL PARAMETER SELECTION & GENERALIZATION TEST ---\n")
+best_gated_tau %>%
+  select(
+    tau_x, tau_y, 
+    train_coverage, test_coverage, 
+    train_avg_area, test_avg_area, 
+    train_efficiency
+  ) %>%
+  print()
+
+# =============================================================================
+# 5. PLOT TRAIN PARETO FRONTIER WITH TEST OVERLAY
+# =============================================================================
+ggplot() +
+  geom_point(data = eval_grid, aes(x = train_avg_area, y = train_coverage), color = "grey80", alpha = 0.4) +
+  geom_line(data = pareto_frontier, aes(x = train_avg_area, y = train_coverage), color = "blue", linewidth = 1) +
+  geom_point(data = best_gated_tau, aes(x = train_avg_area, y = train_coverage), color = "red", size = 4) +
+  geom_point(data = best_gated_tau, aes(x = test_avg_area, y = test_coverage), color = "darkgreen", size = 4) +
+  labs(
+    title = "Pareto Frontier (Chosen on Train Data)",
+    subtitle = "Red dot = Chosen Train Performance | Green dot = Validation Test Performance",
+    x = "Average Ellipse Area (sq yards)",
+    y = "Completed Passes Captured (%)"
+  ) +
+  theme_minimal()
+
+# =============================================================================
+# 6. FIT FINAL PRODUCTION MODELS ON FULL DATASET
+# =============================================================================
+qr_x_final <- rq(abs_err_x ~ receiver_depth, tau = best_gated_tau$tau_x, data = processed_data, method = "fn")
+qr_y_final <- rq(abs_err_y ~ receiver_depth, tau = best_gated_tau$tau_y, data = processed_data, method = "fn")
+
+cat("\n--- FINAL PRODUCTION COEFFICIENTS ---\n")
+cat("Vertical Semi-Axis (Rx) Coefficients:\n")
+print(coef(qr_x_final))
+
+cat("\nHorizontal Semi-Axis (Ry) Coefficients:\n")
+print(coef(qr_y_final))
+
+```
+
+# Plot
+
+```{r}
+
+library(dplyr)
+library(ggplot2)
+library(quantreg)
+library(tidyr)
+
+# 2. Sample 9 distinct plays and calculate dynamic semi-axes (R_x, R_y)
+set.seed(42) # Set seed for reproducible sample selection
+sample_plays <- completed_pass_bounds %>%
+  distinct(game_id, play_id, .keep_all = TRUE) %>%
+  slice_sample(n = 9) %>%
+  mutate(
+    play_label = paste0("Game: ", game_id, " | Play: ", play_id),
+    r_x = pmax(predict(qr_x_final, newdata = .), 0.1),
+    r_y = pmax(predict(qr_y_final, newdata = .), 0.1)
+  )
+
+# 3. Generate 360-degree boundary ellipse coordinates for each play
+theta <- seq(0, 2 * pi, length.out = 100)
+
+ellipse_points <- sample_plays %>%
+  rowwise() %>%
+  reframe(
+    play_label = play_label,
+    ellipse_x = x_std + r_x * cos(theta),
+    ellipse_y = y_std + r_y * sin(theta)
+  )
+
+# 4. Generate 3x3 faceted plot
+ggplot() +
+  # Line of Scrimmage (LOS)
+  geom_vline(
+    data = sample_plays, 
+    aes(xintercept = los_x_std, linetype = "Line of Scrimmage"), 
+    color = "black", linewidth = 0.8
+  ) +
+  # Dynamic Elliptical Throw Boundary Zone
+  geom_polygon(
+    data = ellipse_points, 
+    aes(x = ellipse_x, y = ellipse_y, group = play_label, fill = "Throw Boundary Zone"), 
+    color = "#2563eb", linetype = "dashed", linewidth = 0.7, alpha = 0.15
+  ) +
+  # Targeted Receiver Location
+  geom_point(
+    data = sample_plays, 
+    aes(x = x_std, y = y_std, color = "Targeted Receiver"), 
+    size = 3.5
+  ) +
+  # Ball Landing Location
+  geom_point(
+    data = sample_plays, 
+    aes(x = ball_land_x_std, y = ball_land_y_std, color = "Ball Landing Spot"), 
+    shape = 4, size = 3.5, stroke = 1.5
+  ) +
+  # Aesthetics and Styling
+  scale_color_manual(
+    name = "Key Locations",
+    values = c("Targeted Receiver" = "#16a34a", "Ball Landing Spot" = "#dc2626")
+  ) +
+  scale_fill_manual(
+    name = "Boundary Area",
+    values = c("Throw Boundary Zone" = "#3b82f6")
+  ) +
+  scale_linetype_manual(
+    name = "Field Markers",
+    values = c("Line of Scrimmage" = "dashed")
+  ) +
+  facet_wrap(~ play_label, ncol = 3) +
+  coord_fixed() +
+  theme_minimal() +
+  theme(
+    strip.background = element_rect(fill = "grey92", color = NA),
+    strip.text = element_text(face = "bold", size = 8.5),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "grey80", fill = NA)
+  ) +
+  labs(
+    title = "Targeted Throw Bounds Across 9 Sampled Plays",
+    subtitle = expression(paste("Elliptical boundaries scaled by receiver depth (", tau[x] == 0.945, ", ", tau[y] == 0.990, ")")),
+    x = "Field X (Standardized Yards)",
+    y = "Field Y (Standardized Yards)"
+  )
+
+```
+
+# Non Linear Grid Search
+
+```{r}
+
+library(dplyr)
+library(quantreg)
+library(purrr)
+library(tidyr)
+library(ggplot2)
+library(splines)
+
+# =============================================================================
+# 1. PREPARE DATA & TRAIN / TEST SPLIT
+# =============================================================================
+processed_data <- completed_pass_bounds %>%
+  mutate(
+    receiver_depth = pmax(abs(x_std - los_x_std), 0.1),
+    err_x = ball_land_x_std - x_std,
+    err_y = ball_land_y_std - y_std
+  )
+
+set.seed(42)
+train_idx  <- sample(seq_len(nrow(processed_data)), size = floor(0.80 * nrow(processed_data)))
+train_data <- processed_data[train_idx, ]
+test_data  <- processed_data[-train_idx, ]
+
+# --- RIGOROUS BIAS CALCULATION (FIT ON TRAIN DATA ONLY) ---
+v_test_train <- t.test(train_data$err_x)
+train_p_val  <- v_test_train$p.value
+depth_bias   <- if (train_p_val < 0.05) unname(v_test_train$estimate) else 0.0
+
+# Apply bias correction to train/test targets upfront
+train_data <- train_data %>% 
+  mutate(
+    center_x = x_std + depth_bias,
+    adj_err_x = ball_land_x_std - center_x,
+    abs_err_x = abs(adj_err_x),
+    abs_err_y = abs(err_y)
+  )
+
+test_data <- test_data %>% 
+  mutate(
+    center_x = x_std + depth_bias,
+    adj_err_x = ball_land_x_std - center_x,
+    abs_err_x = abs(adj_err_x),
+    abs_err_y = abs(err_y)
+  )
+
+# =============================================================================
+# 2. DEFINE MODEL FORMULAS
+# =============================================================================
+base_formulas <- list(
+  "linear"      = abs_err ~ receiver_depth,
+  "sqrt"        = abs_err ~ sqrt(receiver_depth),
+  "log"         = abs_err ~ log(receiver_depth + 1),
+  "quadratic"   = abs_err ~ receiver_depth + I(receiver_depth^2),
+  "exponential" = abs_err ~ I(1 - exp(-0.08 * receiver_depth))
+)
+
+spline_grid <- expand_grid(
+  type = c("ns", "bs"),
+  df = 2:4,
+  degree = 2:3
+) %>%
+  filter(type == "ns" | (type == "bs" & df > degree)) %>%
+  mutate(
+    name = ifelse(type == "ns", sprintf("ns_df%d_deg%d", df, degree), sprintf("bs_df%d_deg%d", df, degree)),
+    formula_str = ifelse(
+      type == "ns",
+      sprintf("abs_err ~ ns(receiver_depth, df = %d)", df),
+      sprintf("abs_err ~ bs(receiver_depth, df = %d, degree = %d)", df, degree)
+    )
+  )
+
+spline_formulas <- set_names(map(spline_grid$formula_str, as.formula), spline_grid$name)
+model_formulas  <- c(base_formulas, spline_formulas)
+
+tau_x_cand <- seq(0.85, 0.995, by = 0.005)
+tau_y_cand <- seq(0.85, 0.995, by = 0.005)
+
+# =============================================================================
+# 3. RUN GRID SEARCH (CONSISTENT BIAS-ADJUSTED COVERAGE)
+# =============================================================================
+grid_results <- map_dfr(names(model_formulas), function(shape_name) {
+  
+  f_x <- update(model_formulas[[shape_name]], abs_err_x ~ .)
+  f_y <- update(model_formulas[[shape_name]], abs_err_y ~ .)
+  
+  models_x <- map(tau_x_cand, ~ rq(f_x, tau = .x, data = train_data, method = "fn"))
+  models_y <- map(tau_y_cand, ~ rq(f_y, tau = .x, data = train_data, method = "fn"))
+  names(models_x) <- as.character(tau_x_cand)
+  names(models_y) <- as.character(tau_y_cand)
+  
+  preds_x_train <- map(models_x, ~ pmax(predict(.x, newdata = train_data), 0.1))
+  preds_y_train <- map(models_y, ~ pmax(predict(.x, newdata = train_data), 0.1))
+  preds_x_test  <- map(models_x, ~ pmax(predict(.x, newdata = test_data), 0.1))
+  preds_y_test  <- map(models_y, ~ pmax(predict(.x, newdata = test_data), 0.1))
+  
+  tau_grid <- expand_grid(tau_x = tau_x_cand, tau_y = tau_y_cand)
+  
+  map2_dfr(tau_grid$tau_x, tau_grid$tau_y, function(tx, ty) {
+    rx_tr <- preds_x_train[[as.character(tx)]]
+    ry_tr <- preds_y_train[[as.character(ty)]]
+    cov_tr <- mean(((train_data$adj_err_x / rx_tr)^2 + (train_data$err_y / ry_tr)^2) <= 1.0)
+    area_tr <- mean(pi * rx_tr * ry_tr)
+    
+    rx_te <- preds_x_test[[as.character(tx)]]
+    ry_te <- preds_y_test[[as.character(ty)]]
+    cov_te <- mean(((test_data$adj_err_x / rx_te)^2 + (test_data$err_y / ry_te)^2) <= 1.0)
+    area_te <- mean(pi * rx_te * ry_te)
+    
+    tibble(
+      shape = shape_name,
+      tau_x = tx,
+      tau_y = ty,
+      train_coverage = cov_tr,
+      train_avg_area = area_tr,
+      test_coverage  = cov_te,
+      test_avg_area  = area_te
+    )
+  })
+})
+
+# =============================================================================
+# 4. PARETO FRONTIER RANKING
+# =============================================================================
+best_by_shape <- grid_results %>%
+  group_by(shape) %>%
+  arrange(train_avg_area) %>%
+  mutate(max_cov = cummax(train_coverage)) %>%
+  filter(train_coverage == max_cov) %>%
+  distinct(train_coverage, .keep_all = TRUE) %>%
+  mutate(
+    d_cov = train_coverage - lag(train_coverage),
+    d_area = train_avg_area - lag(train_avg_area),
+    train_efficiency = d_cov / d_area
+  ) %>%
+  ungroup() %>%
+  filter(train_coverage >= 0.90) %>%
+  group_by(shape) %>%
+  arrange(desc(train_efficiency)) %>%
+  slice(1) %>%
+  ungroup() %>%
+  arrange(desc(train_efficiency))
+
+cat("--- COMPARISON OF BOUNDARY SHAPES (Gated >= 90% Coverage) ---\n")
+print(best_by_shape %>% select(shape, tau_x, tau_y, train_coverage, test_coverage, train_avg_area, train_efficiency))
+
+# =============================================================================
+# 5. SEQUENTIAL SPATIAL CALIBRATION CHECK ON OUT-OF-SAMPLE DATA
+# =============================================================================
+winning_model_found <- FALSE
+
+for (i in seq_len(nrow(best_by_shape))) {
+  
+  candidate <- best_by_shape[i, ]
+  shape_name <- candidate$shape
+  tx <- candidate$tau_x
+  ty <- candidate$tau_y
+  
+  cat(sprintf("\n=========================================================\n"))
+  cat(sprintf("EVALUATING RANK %d MODEL: %s (tau_x: %.3f, tau_y: %.3f)\n", i, toupper(shape_name), tx, ty))
+  cat(sprintf("=========================================================\n"))
+  
+  f_x <- update(model_formulas[[shape_name]], abs_err_x ~ .)
+  f_y <- update(model_formulas[[shape_name]], abs_err_y ~ .)
+  
+  mod_x <- rq(f_x, tau = tx, data = train_data, method = "fn")
+  mod_y <- rq(f_y, tau = ty, data = train_data, method = "fn")
+  
+  calibration_table <- test_data %>%
+    mutate(
+      r_x = pmax(predict(mod_x, newdata = .), 0.1),
+      r_y = pmax(predict(mod_y, newdata = .), 0.1),
+      in_ellipse = (((adj_err_x) / r_x)^2 + ((err_y) / r_y)^2) <= 1.0,
+      depth_bucket = cut(
+        receiver_depth, 
+        breaks = c(0, 5, 12, 20, 60), 
+        labels = c("Short (0-5y)", "Medium (5-12y)", "Deep (12-20y)", "Ultra-Deep (20y+)")
+      )
+    ) %>%
+    group_by(depth_bucket) %>%
+    summarize(
+      n_passes = n(),
+      empirical_coverage = mean(in_ellipse),
+      avg_rx = mean(r_x),
+      avg_ry = mean(r_y),
+      .groups = "drop"
+    )
+  
+  print(calibration_table)
+  
+  if (all(calibration_table$empirical_coverage >= 0.85)) {
+    cat(sprintf("\n>>> SUCCESS: '%s' model passed all tests with >= 85%% coverage across all pass depths! <<<\n", shape_name))
+    winning_model_found <- TRUE
+    winning_shape <- shape_name
+    winning_tau_x <- tx
+    winning_tau_y <- ty
+    break
+  } else {
+    cat(sprintf("\n---> REJECTED: '%s' model failed the >= 85%% bucket coverage threshold. Checking next model...\n", shape_name))
+  }
+}
+
+# =============================================================================
+# 6. PRODUCTION FIT & SAFE ARTIFACT EXPORT
+# =============================================================================
+if (winning_model_found) {
+  cat(sprintf("\n--- FITTING FINAL PRODUCTION MODEL (%s) ON FULL DATASET ---\n", toupper(winning_shape)))
+  
+  # Compute final bias on full dataset
+  full_v_test <- t.test(processed_data$err_x)
+  final_lead_bias <- if (full_v_test$p.value < 0.05) unname(full_v_test$estimate) else 0.0
+  
+  prod_data <- processed_data %>%
+    mutate(
+      center_x = x_std + final_lead_bias,
+      abs_err_x = abs(ball_land_x_std - center_x),
+      abs_err_y = abs(err_y)
+    )
+  
+  f_prod_x <- update(model_formulas[[winning_shape]], abs_err_x ~ .)
+  f_prod_y <- update(model_formulas[[winning_shape]], abs_err_y ~ .)
+  
+  qr_x_production <- rq(f_prod_x, tau = winning_tau_x, data = prod_data, method = "fn")
+  qr_y_production <- rq(f_prod_y, tau = winning_tau_y, data = prod_data, method = "fn")
+  
+  # Bundle and export safely inside the conditional block
+  model_bundle <- list(
+    qr_x = qr_x_production,
+    qr_y = qr_y_production,
+    winning_shape = winning_shape,
+    winning_tau_x = winning_tau_x,
+    winning_tau_y = winning_tau_y,
+    lead_bias = final_lead_bias
+  )
+  
+  save_path <- "~/Documents/Sports Analytics/2026 CMSAC RRC/pitch_control_spline_model.rds"
+  saveRDS(model_bundle, file = save_path)
+  cat(sprintf("Model bundle successfully exported to: %s\n", save_path))
+  
+} else {
+  cat("\nNo models passed the >= 85% bucket coverage requirement across all pass depths.\n")
+}
+
+```
+
+# Visual Diagnostic
+
+```{r}
+
+library(ggplot2)
+library(dplyr)
+library(purrr)
+
+# 1. Select 12 sample plays across depth categories and assign unique Play IDs
+set.seed(123)
+sample_plays <- test_data %>%
+  group_by(cut(receiver_depth, breaks = c(0, 5, 12, 20, 60))) %>%
+  slice_sample(n = 3) %>%
+  ungroup() %>%
+  mutate(play_id = row_number()) %>%
+  predict_throw_boundary(lead_bias = depth_lead_bias)
+
+# 2. Generate parametric ellipse coordinates for each play
+ellipse_points <- map_dfr(seq_len(nrow(sample_plays)), function(i) {
+  play <- sample_plays[i, ]
+  theta <- seq(0, 2 * pi, length.out = 100)
+  
+  tibble(
+    play_id = play$play_id,
+    facet_label = sprintf("Play #%d (Depth: %.1fy)", play$play_id, play$receiver_depth),
+    ellipse_x = play$center_x + play$r_x * cos(theta),
+    ellipse_y = play$center_y + play$r_y * sin(theta),
+    ball_x = play$ball_land_x_std,
+    ball_y = play$ball_land_y_std,
+    rx_point = play$x_std,
+    ry_point = play$y_std
+  )
+})
+
+# 3. Plot grid with panel-level square aspect ratios
+ggplot(ellipse_points, aes(x = ellipse_y, y = ellipse_x)) +
+  geom_polygon(aes(group = play_id), fill = "steelblue", alpha = 0.2, color = "dodgerblue4", linewidth = 0.8) +
+  geom_point(aes(x = ry_point, y = rx_point), color = "black", shape = 4, size = 3, stroke = 1.2) + # Receiver Target (X)
+  geom_point(aes(x = ball_y, y = ball_x), color = "firebrick", size = 2.5) +                          # Ball Landing Spot
+  facet_wrap(~ facet_label, scales = "free", ncol = 4) +
+  labs(
+    title = "Bias-Adjusted Pitch Control Boundaries by Play",
+    subtitle = "Black 'X' = Targeted Receiver Spot | Blue Ellipse = Boundary (+1.59y Bias) | Red Dot = Ball Landing Spot",
+    x = "Field Width (Y-Std)",
+    y = "Field Depth (X-Std)"
+  ) +
+  theme_minimal() +
+  theme(
+    aspect.ratio = 1, # Keeps each facet box square while allowing free scale limits
+    strip.text = element_text(face = "bold", size = 10),
+    panel.grid.minor = element_blank()
+  )
+
+```

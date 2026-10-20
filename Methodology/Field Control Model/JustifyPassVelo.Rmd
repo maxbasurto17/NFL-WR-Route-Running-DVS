@@ -1,0 +1,24 @@
+---
+title: "JustifyPassVelo"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+full_df <- read.csv("full_data.csv")
+```
+
+```{r}
+pass_velo <- full_df %>% 
+  filter(phase == "pre_pass", player_role == "Passer") %>% 
+  group_by(play_id, game_id) %>% 
+  filter(frame_id == max(frame_id)) %>% 
+  mutate(throw_time = num_frames_output/10,
+         throw_dist = sqrt((x-ball_land_x)^2 + (y-ball_land_y)^2)) %>% 
+  summarize(throw_speed = throw_dist/throw_time) %>% 
+  ungroup() %>% 
+  summarize(
+    p05_speed = quantile(throw_speed, probs = 0.05, na.rm = TRUE),
+    p95_speed = quantile(throw_speed, probs = 0.95, na.rm = TRUE)
+  )
+```

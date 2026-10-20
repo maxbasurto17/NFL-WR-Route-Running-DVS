@@ -1,0 +1,246 @@
+---
+title: "field_control_plot"
+output: html_document
+---
+
+# Set Up
+
+```{r}
+
+library(tidyverse)
+library(gganimate)
+
+# =============================================================================
+# 1. LOAD DATASETS
+# =============================================================================
+tracking_data <- read_csv("~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/full_data.csv")
+control_data  <- read_csv("~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/field_control_data.csv")
+
+# Compute vx and vy if they are missing
+if (!all(c("vx", "vy") %in% names(tracking_data))) {
+  tracking_data <- tracking_data %>%
+    mutate(
+      # Convert dir degrees to radians
+      dir_rad = (dir * pi) / 180,
+      vx = s * sin(dir_rad),
+      vy = s * cos(dir_rad)
+    )
+}
+
+```
+
+# Identify Plays of Interest
+
+```{r}
+
+specific_game <- tracking_data %>%
+  filter(possession_team == "IND", defensive_team == "LA", quarter == 3)
+
+target_game_id <- 2023100106
+target_play_id <- 2008
+
+# Build the missing play_results list structure explicitly for the pipeline
+play_results <- list(
+  player_data = tracking_data %>% filter(game_id == target_game_id, play_id == target_play_id),
+  surface_data = control_data %>% filter(game_id == target_game_id, play_id == target_play_id)
+)
+
+```
+
+# Plot
+
+```{r}
+# =============================================================================
+# 3. DEFINE PLOTTING FUNCTION
+# =============================================================================
+# Function to plot a single, specific moment/frame
+plot_nfl_pitch_control_moment <- function(play_results, target_frame = NULL) {
+  
+  player_df <- play_results$player_data %>%
+    mutate(player_side = tolower(player_side)) %>%
+    filter(!is.na(x_std) & !is.na(y_std))
+  
+  surface_df <- play_results$surface_data
+  
+  if (is.null(target_frame)) {
+    if ("event" %in% names(player_df) && any(player_df$event %in% c("pass_arrived", "pass_outcome_caught"))) {
+      target_frame <- player_df %>% 
+        filter(event %in% c("pass_arrived", "pass_outcome_caught")) %>% 
+        pull(frame_id) %>% 
+        min()
+    } else {
+      target_frame <- median(unique(player_df$frame_id))
+    }
+  }
+  
+  player_snapshot <- player_df %>% filter(frame_id == target_frame)
+  surface_snapshot <- surface_df %>% filter(frame_id == target_frame)
+  
+  # Target receiver identification
+  if ("is_target" %in% names(player_snapshot)) {
+    player_snapshot <- player_snapshot %>% mutate(is_target_flag = coalesce(is_target, 0) == 1)
+  } else if ("player_role" %in% names(player_snapshot)) {
+    player_snapshot <- player_snapshot %>% mutate(is_target_flag = player_role == "Targeted Receiver")
+  } else {
+    player_snapshot <- player_snapshot %>% mutate(is_target_flag = FALSE)
+  }
+  
+  # Assign roles to player categories (Defense, Offense, Quarterback)
+  player_snapshot <- player_snapshot %>%
+    mutate(
+      display_category = case_when(
+        player_role == "Passer" ~ "Quarterback",
+        player_side == "offense" ~ "Offense",
+        player_side == "defense" ~ "Defense",
+        TRUE ~ "Offense"
+      )
+    )
+  
+  # Ball Landing Marker Data Frame (for unified legend integration)
+  ball_land <- player_snapshot %>%
+    filter(!is.na(ball_land_x_std) & !is.na(ball_land_y_std)) %>%
+    select(ball_land_x_std, ball_land_y_std) %>%
+    distinct() %>%
+    slice(1)
+  
+  # Separation & Larger Label Box Placement
+  target_row <- player_snapshot %>% filter(is_target_flag == TRUE) %>% slice(1)
+  def_rows <- player_snapshot %>% filter(player_side == "defense")
+  
+  separation_df <- NULL
+  if (nrow(target_row) > 0 && nrow(def_rows) > 0) {
+    closest_def <- def_rows %>%
+      mutate(dist = sqrt((x_std - target_row$x_std)^2 + (y_std - target_row$y_std)^2)) %>%
+      slice_min(dist, n = 1, with_ties = FALSE)
+    
+    separation_df <- data.frame(
+      x_target = target_row$x_std,
+      y_target = target_row$y_std,
+      x_def = closest_def$x_std,
+      y_def = closest_def$y_std,
+      label_x = 105, # Shifted to bottom right corner
+      label_y = 6,   # Above bottom field border
+      dist_label = sprintf("Separation: %.1f yds", closest_def$dist)
+    )
+  }
+
+  ymin <- 0; ymax <- 53.3
+  xmin <- 0; xmax <- 120
+  
+  ggplot() +
+    # Field Background
+    annotate("rect", xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = "#1e7a3a") +
+    annotate("rect", xmin = 0, xmax = 10, ymin = ymin, ymax = ymax, fill = "#135c29") +
+    annotate("rect", xmin = 110, xmax = 120, ymin = ymin, ymax = ymax, fill = "#135c29") +
+    geom_vline(xintercept = seq(10, 110, by = 5), color = "white", alpha = 0.4) +
+    geom_vline(xintercept = seq(10, 110, by = 10), color = "white", linewidth = 0.8) +
+    
+    # Pitch Control Heatmap Surface
+    geom_tile(
+      data = surface_snapshot,
+      aes(x = x, y = y, fill = ppcf_att),
+      width = 1, height = 1,
+      alpha = 0.65
+    ) +
+    scale_fill_gradient2(
+      low = "#1e40af", mid = "white", high = "#b91c1c",
+      midpoint = 0.5, limits = c(0, 1),
+      name = "Offense\nControl",
+      na.value = "transparent"
+    ) +
+    
+    # Ball Landing Spot (Layered point aesthetics mapped to Ball Landing legend item)
+    {if (nrow(ball_land) > 0) list(
+      geom_point(data = ball_land, aes(x = ball_land_x_std, y = ball_land_y_std), shape = 4, size = 5, stroke = 2, color = "black"),
+      geom_point(data = ball_land, aes(x = ball_land_x_std, y = ball_land_y_std, color = "Ball Landing"), shape = 21, size = 3.5, stroke = 1.2, fill = "#eab308")
+    )} +
+    
+    # Separation Line
+    {if (!is.null(separation_df)) list(
+      geom_segment(data = separation_df, aes(x = x_target, y = y_target, xend = x_def, yend = y_def), color = "#dc2626", linetype = "dashed", linewidth = 0.9)
+    )} +
+    
+    # Velocity Vectors
+    geom_segment(
+      data = player_snapshot,
+      aes(x = x_std, y = y_std, xend = x_std + vx * 0.5, yend = y_std + vy * 0.5, color = display_category),
+      arrow = arrow(length = unit(0.15, "cm")),
+      linewidth = 0.8,
+      show.legend = FALSE
+    ) +
+    
+    # Player Dots (Black border + colored core mapped to scale_color_manual)
+    geom_point(data = player_snapshot, aes(x = x_std, y = y_std), size = 4.5, color = "black") +
+    geom_point(data = player_snapshot, aes(x = x_std, y = y_std, color = display_category), size = 3.2) +
+    
+    # Targeted Receiver Ring
+    geom_point(
+      data = player_snapshot %>% filter(is_target_flag == TRUE),
+      aes(x = x_std, y = y_std),
+      size = 6.5, color = "#dc2626", shape = 21, stroke = 1.5
+    ) +
+    
+    # Larger Separation Tracker Box
+    {if (!is.null(separation_df)) list(
+      geom_label(
+        data = separation_df, 
+        aes(x = label_x, y = label_y, label = dist_label), 
+        size = 4, 
+        fill = "white", 
+        color = "#dc2626", 
+        fontface = "bold", 
+        label.padding = unit(0.3, "lines"),
+        linewidth = 0.8
+      )
+    )} +
+    
+    # Custom Color Scale Including Defense, Offense, Quarterback, and Ball Landing
+    scale_color_manual(
+      values = c(
+        "Defense" = "#3b82f6",
+        "Offense" = "#facc15",
+        "Quarterback" = "#10b981",
+        "Ball Landing" = "#eab308"
+      ),
+      breaks = c("Offense", "Defense", "Quarterback", "Ball Landing"),
+      name = "Key"
+    ) +
+    
+    coord_fixed(xlim = c(0, 120), ylim = c(0, 53.3)) +
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      legend.position = "right",
+      legend.box = "vertical",
+      legend.title = element_text(face = "bold", size = 11),
+      legend.text = element_text(size = 10)
+    ) +
+    labs(
+      title = "Euclidean Distance Separation vs Pitch Control at Time of Pass",
+      subtitle = "Rams @ Colts Week 4 3rd Quarter: Incomplete Pass Deep Left"
+    )
+}
+# --- GENERATE STATIC PLOT ---
+
+max_pre_pass_frame <- tracking_data %>%
+  filter(phase == "pre_pass", game_id == target_game_id, play_id == target_play_id) %>%
+  summarise(max_frame = max(frame_id, na.rm = TRUE)) %>%
+  pull(max_frame)
+
+static_plot <- plot_nfl_pitch_control_moment(play_results, target_frame = max_pre_pass_frame)
+print(static_plot)
+
+ggsave(
+  filename = "~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/Plots/field_control_raw_sep_example.png",
+  plot = static_plot,
+  width = 8.5,
+  height = 7.5,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
+
+
+```

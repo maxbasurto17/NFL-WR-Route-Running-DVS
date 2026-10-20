@@ -1,0 +1,33 @@
+---
+title: "Combine_Frame_Efficiency"
+output: html_document
+---
+
+```{r}
+Palmer <- read.csv("~/Documents/Football_R/CMSAC--Field Value/Frame_Efficiency/Palmer_frame_coverage_efficiency.csv")
+Godwin <- read.csv("~/Documents/Football_R/CMSAC--Field Value/Frame_Efficiency/Godwin_frame_coverage_efficiency.csv")
+Devonta <- read.csv("~/Documents/Football_R/CMSAC--Field Value/Frame_Efficiency/Devonta_frame_coverage_efficiency.csv")
+Jefferson <- read.csv("~/Documents/Football_R/CMSAC--Field Value/Frame_Efficiency/Jefferson_frame_coverage_efficiency.csv")
+Metcalf <- read.csv("~/Documents/Football_R/CMSAC--Field Value/Frame_Efficiency/Metcalf_frame_coverage_efficiency.csv")
+Olave <- read.csv("~/Documents/Football_R/CMSAC--Field Value/Frame_Efficiency/Olave_frame_coverage_efficiency.csv")
+Pickens <- read.csv("~/Documents/Football_R/CMSAC--Field Value/Frame_Efficiency/Pickens_frame_coverage_efficiency.csv")
+Davantae <- read.csv("~/Documents/Football_R/CMSAC--Field Value/Frame_Efficiency/Davantae_frame_coverage_efficiency.csv")
+Pittman <- read.csv("~/Documents/Football_R/CMSAC--Field Value/Frame_Efficiency/Pittman_frame_coverage_efficiency.csv")
+Diggs <- read.csv("~/Documents/Football_R/CMSAC--Field Value/Frame_Efficiency/Diggs_frame_coverage_efficiency.csv")
+Jamarr <- read.csv("~/Documents/Football_R/CMSAC--Field Value/Frame_Efficiency/Jamarr_Chase_frame_coverage_efficiency.csv")
+Keenan <- read.csv("~/Documents/Football_R/CMSAC--Field Value/Frame_Efficiency/Keenan_Allen_frame_coverage_efficiency.csv")
+Amari <- read.csv("~/Documents/Football_R/CMSAC--Field Value/Frame_Efficiency/Amari_Cooper_frame_coverage_efficiency.csv")
+Nico <- read.csv("~/Documents/Football_R/CMSAC--Field Value/Frame_Efficiency/Nico_Collins_frame_coverage_efficiency.csv")
+Aiyuk <- read.csv("~/Documents/Football_R/CMSAC--Field Value/Frame_Efficiency/Aiyuk_frame_coverage_efficiency.csv")
+Moore <- read.csv("~/Documents/Football_R/CMSAC--Field Value/Frame_Efficiency/DJ_Moore_frame_coverage_efficiency.csv")
+AJB <- read.csv("~/Documents/Football_R/CMSAC--Field Value/Frame_Efficiency/AJB_frame_coverage_efficiency.csv")
+Puka <- read.csv("~/Documents/Football_R/CMSAC--Field Value/Frame_Efficiency/Puka_frame_coverage_efficiency.csv")
+ARSB <- read.csv("~/Documents/Football_R/CMSAC--Field Value/Frame_Efficiency/ARSB_frame_coverage_efficiency.csv")
+Lamb <- read.csv("~/Documents/Football_R/CMSAC--Field Value/Frame_Efficiency/CD_Lamb_frame_coverage_efficiency.csv")
+Tyreek <- read.csv("~/Documents/Football_R/CMSAC--Field Value/Frame_Efficiency/Tyreek_Hill_frame_coverage_efficiency.csv")
+Evans <- read.csv("~/Documents/Football_R/CMSAC--Field Value/Frame_Efficiency/Mike_Evans_frame_coverage_efficiency.csv")
+
+all_frames <- rbind(Palmer, Godwin, Devonta, Jefferson, Metcalf, Olave, Pickens, Davantae, Pittman, Diggs, Jamarr, Keenan, Amari, Nico, Aiyuk, Moore, AJB, Puka, ARSB, Lamb, Tyreek, Evans)
+
+write.csv(all_frames, "~/Documents/Football_R/CMSAC--Field Value/Frame_Efficiency/top20_frame_efficiency.csv")
+```

@@ -1,0 +1,191 @@
+---
+title: "Coverage_Efficiency"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(nflfastR)
+library(nflplotR)
+library(purrr)
+library(mgcv)
+library(ggplot2)
+library(dplyr)
+library(readr)
+
+# Tracking Data
+full_df <- read_csv("~/Documents/Football_R/CMSAC--Field Value/full_data.csv")
+field_control <- read.csv("~/Documents/Football_R/CMSAC--Field Value/field_control_data.csv")
+
+#Field Value Model
+field_value <- readRDS("~/Documents/Football_R/CMSAC--Field Value/gam_field_value_model.rds")
+```
+
+```{r}
+play_data <- full_df %>% 
+  select(game_id, play_id, frame_id, ball_land_y_std, expected_points, los_x_std, dropback_distance) %>% 
+  distinct()
+
+feed_model <- field_control %>% 
+  left_join(play_data, by = c("game_id", "frame_id", "play_id")) %>% 
+  mutate(pass_depth = x - los_x_std) %>% 
+  # Eliminate impossible passes that land beyond the back of the endzone (110 yards)
+  filter((los_x_std + pass_depth) <= 110)
+
+# Assuming your big dataset is loaded, or you are reading it in chunks
+chunk_size <- 1000000  # Process 1 million rows at a time
+total_rows <- nrow(feed_model)
+predictions_list <- list()
+
+for (i in seq(1, total_rows, by = chunk_size)) {
+  
+  # Define start and end of chunk
+  start_row <- i
+  end_row <- min(i + chunk_size - 1, total_rows)
+  
+  # Subset the data
+  chunk <- feed_model[start_row:end_row, ]
+  
+  # Predict and store in the list
+  cat("Predicting rows", start_row, "to", end_row, "\n")
+  predictions_list[[length(predictions_list) + 1]] <- predict(field_value, newdata = chunk)
+  
+  # Free up memory
+  rm(chunk)
+  gc() # Force garbage collection
+}
+
+# Combine all predictions back together, compute point efficiency
+feed_model$pred_post_epa <- unlist(predictions_list)
+feed_model$epa <-  feed_model$pred_post_epa - feed_model$expected_points
+feed_model$efficiency <- feed_model$epa * feed_model$ppcf_att
+all_efficiency <- feed_model %>% 
+  mutate(efficiency = ifelse((pass_depth - dropback_distance) <= 0, 0, efficiency)) %>% 
+  group_by(game_id, play_id) %>% 
+  summarize(
+    coverage_efficiency = mean(efficiency),
+    throw_frame = first(frame_id), 
+    pass_depth = first(pass_depth)
+  )
+
+write.csv(feed_model, "grid_coverage_efficiency.csv")
+write.csv(all_efficiency, "pbp_coverage_efficiency.csv")
+```
+
+```{r}
+single_play <- feed_model %>% 
+  filter(game_id == 2023090700, play_id == 461)
+
+plays_list <- full_df %>%
+  filter(game_id == 2023090700, play_id == 461)
+
+extract_player_data <- function(play_data) {
+  
+  # Filter and mutate to create the clean player_data dataframe
+  player_data <- play_data %>%
+    filter(!is.na(nfl_id), phase == "pre_pass") %>%
+    mutate(
+      player_side = tolower(player_side), 
+      dir_rad = dir_std * pi / 180, 
+      vx = s * sin(dir_rad),
+      vy = s * cos(dir_rad)
+    ) %>%
+    filter(!is.na(x_std) & !is.na(y_std) & !is.na(vx) & !is.na(vy))
+  
+  # Return NULL if the resulting dataframe is empty
+  if (nrow(player_data) == 0) return(NULL)
+  
+  return(player_data)
+}
+
+# 2. Define the static plotting function
+plot_nfl_efficiency_static <- function(surface_data, player_data) {
+  
+  # Filter out NAs based on the standardized coordinate names
+  player_data <- player_data %>%
+    mutate(player_side = tolower(player_side)) %>%
+    filter(!is.na(x_std) & !is.na(y_std) & !is.na(vx) & !is.na(vy))
+  
+  ymin <- 0; ymax <- 53.3
+  xmin <- 0; xmax <- 120
+  
+  field_plot <- ggplot() +
+    annotate("rect", xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = "#1e7a3a") +
+    annotate("rect", xmin = 0, xmax = 10, ymin = ymin, ymax = ymax, fill = "#135c29") +
+    annotate("rect", xmin = 110, xmax = 120, ymin = ymin, ymax = ymax, fill = "#135c29") +
+    geom_vline(xintercept = seq(10, 110, by = 5), color = "white", alpha = 0.5) +
+    geom_vline(xintercept = seq(10, 110, by = 10), color = "white", linewidth = 1)
+  
+  static_plot <- field_plot +
+    
+    # Efficiency tile surface
+    geom_tile(
+      data = surface_data, 
+      aes(x = x, y = y, fill = efficiency), 
+      alpha = 0.65
+    ) +
+    # Updated color scale to handle efficiency's negative and positive range
+    scale_fill_gradient2(
+      low = "#1e40af", mid = "white", high = "#b91c1c", 
+      midpoint = 0, 
+      name = "Efficiency"
+    ) +
+    
+    # Velocity Vectors 
+    geom_segment(
+      data = player_data,
+      aes(
+        x = x_std, y = y_std, 
+        xend = x_std + vx * 0.5, yend = y_std + vy * 0.5,
+        color = player_side
+      ),
+      arrow = arrow(length = unit(0.1, "cm")), 
+      linewidth = 0.8 
+    ) +
+    
+    # Black borders for player dots 
+    geom_point(
+      data = player_data, 
+      aes(x = x_std, y = y_std), 
+      size = 4, color = "black"
+    ) +
+    
+    # Colored inside for player dots 
+    geom_point(
+      data = player_data, 
+      aes(x = x_std, y = y_std, color = player_side), 
+      size = 2.8 
+    ) +
+    
+    scale_color_manual(
+      values = c("offense" = "#facc15", "defense" = "#3b82f6"),
+      name = "Team"
+    ) +
+    
+    coord_fixed() +
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      legend.position = "bottom"
+    ) +
+    
+    labs(title = 'Play Efficiency Surface')
+  
+  return(static_plot)
+}
+
+# =============================================================================
+# --- RENDER ---
+# =============================================================================
+
+# NOTE: You must provide a valid `player_data` dataframe from your environment
+# for the players to render on the field.
+
+static_plot <- plot_nfl_efficiency_static(surface_data = single_play, player_data = extract_player_data(plays_list))
+print(static_plot)
+
+# If you want to save it as an image file:
+# ggsave("static_efficiency_plot.png", plot = static_plot, width = 10, height = 5, dpi = 300)
+```

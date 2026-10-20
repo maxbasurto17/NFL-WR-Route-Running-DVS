@@ -1,0 +1,256 @@
+---
+title: "field_value_test"
+output: html_document
+---
+
+# Libraries & Data
+
+```{r}
+
+# Key Libraries
+library(tidyverse)
+library(nflfastR)
+library(nflplotR)
+library(purrr)
+library(readr)
+library(mgcv)
+
+# Tracking Data
+full_df <- read_csv("~/Documents/Football_R/CMSAC--Field Value/full_data.csv")
+```
+
+# Completed Passes
+
+```{r}
+
+# Get completed passes from supplementary data
+completed_passes <- full_df %>%
+  filter(pass_result == "C") %>% 
+  dplyr::select(
+    # Play identifiers
+    game_id, play_id,
+    # Play context
+    down, yards_to_go, absolute_yardline_number,
+    # Play location
+    play_direction, ball_land_x, ball_land_y,
+    # Play value
+    yards_gained, expected_points_added
+    ) %>% 
+  distinct()
+
+
+```
+
+# Visualize Plays
+
+```{r}
+# =========================================================
+# 1. USER INPUT: Choose the game and play to visualize
+# =========================================================
+target_game_id <- 2023090700  # Set your desired game_id
+target_play_id <- 461 # Set your desired play_id
+
+# =========================================================
+# 2. Filter & Standardize Coordinates
+# =========================================================
+play_data <- completed_passes %>% 
+  filter(game_id == target_game_id, play_id == target_play_id) %>% 
+  mutate(
+    # Standardize Line of Scrimmage (LOS)
+    los_x_std = if_else(play_direction == "left", 120 - absolute_yardline_number, absolute_yardline_number),
+    
+    # First Down Line (always offset to the right)
+    first_down_x_std = los_x_std + yards_to_go,
+    
+    # Standardize Ball Landing Spot
+    ball_land_x_std = if_else(play_direction == "left", 120 - ball_land_x, ball_land_x),
+    ball_land_y_std = if_else(play_direction == "left", 53.3 - ball_land_y, ball_land_y)
+  )
+
+# =========================================================
+# 3. Plot Field Layout & Pass Vector
+# =========================================================
+ggplot(play_data) +
+  # --- Grass Turf & Endzones ---
+  annotate("rect", xmin = 0, xmax = 120, ymin = 0, ymax = 53.3, fill = "#1e4620") +
+  annotate("rect", xmin = 0, xmax = 10, ymin = 0, ymax = 53.3, fill = "#143016") +   # Left Endzone
+  annotate("rect", xmin = 110, xmax = 120, ymin = 0, ymax = 53.3, fill = "#143016") +  # Right Endzone
+  geom_vline(xintercept = seq(10, 110, by = 10), color = "white", alpha = 0.25, linetype = "dashed") +
+  geom_vline(xintercept = c(10, 110), color = "white", linewidth = 1) +              # Goal lines
+  
+  # --- Line of Scrimmage (Blue) & First Down Marker (Yellow) ---
+  geom_vline(aes(xintercept = los_x_std), color = "#4A90E2", linewidth = 1.2) +
+  geom_vline(aes(xintercept = first_down_x_std), color = "#F5A623", linewidth = 1, linetype = "dashed") +
+  
+  # --- Pass Trajectory Arrow (From LOS center to Landing Spot) ---
+  geom_segment(
+    aes(
+      x = los_x_std, 
+      y = 26.65, 
+      xend = ball_land_x_std, 
+      yend = ball_land_y_std
+    ),
+    color = "white",
+    linewidth = 1.2,
+    arrow = arrow(length = unit(0.3, "cm"), type = "closed")
+  ) +
+  
+  # --- Catch / Landing Spot Marker ---
+  geom_point(
+    aes(x = ball_land_x_std, y = ball_land_y_std), 
+    color = "#FF3333", size = 4, shape = 4, stroke = 2
+  ) +
+  
+  # --- On-Field HUD / Play Statistics Text ---
+  geom_label(
+    aes(
+      x = 60, y = 48,
+      label = paste0(
+        "Down: ", down, " & ", yards_to_go, 
+        " | Yards Gained: ", yards_gained, 
+        " | EPA: ", round(expected_points_added, 2)
+      )
+    ),
+    fill = "#0f172a", color = "white", fontface = "bold", size = 4
+  ) +
+  
+  # --- Formatting & Dimensions ---
+  coord_fixed(ratio = 1, xlim = c(0, 120), ylim = c(0, 53.3)) +
+  labs(
+    title = paste0("Pass Location Check — Game: ", target_game_id, " | Play: ", target_play_id),
+    subtitle = "Blue Line = LOS | Yellow Line = 1st Down Line | Arrow = Throw Vector | Red X = Catch Spot",
+    x = "Field Length (Yards)",
+    y = "Field Width (Yards)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.background = element_rect(fill = "#0f172a", color = NA),
+    panel.background = element_rect(fill = "#0f172a", color = NA),
+    text = element_text(color = "white"),
+    axis.text = element_text(color = "gray80"),
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(color = "gray70", size = 10)
+  )
+
+
+```
+
+# Field Value Model
+
+```{r}
+
+# ---------------------------------------------------------
+# 1. Prepare Data & Compute Post-Play Expected Points
+# ---------------------------------------------------------
+completed_passes <- full_df %>%
+  filter(pass_result == "C") %>% 
+  dplyr::select(
+    game_id, play_id, 
+    los_x_std, ball_land_x_std, ball_land_y_std, 
+    expected_points, expected_points_added
+  ) %>% 
+  distinct() %>% 
+  mutate(
+    # Compute Post-Play Expected Points
+    post_ep = expected_points + expected_points_added,
+    
+    # Pass Depth relative to LOS
+    pass_depth = ball_land_x_std - los_x_std
+  ) %>% 
+  filter(
+    pass_depth >= -10 & pass_depth <= 45, 
+    ball_land_y_std >= 0 & ball_land_y_std <= 53.3
+  )
+
+# ---------------------------------------------------------
+# 1b. Apply Symmetry Mirroring
+# ---------------------------------------------------------
+completed_passes_sym <- bind_rows(
+  completed_passes,
+  completed_passes %>% mutate(ball_land_y_std = 53.3 - ball_land_y_std)
+)
+
+# ---------------------------------------------------------
+# 2. Fit GAM with EP_pre as a Control Term
+# ---------------------------------------------------------
+gam_model <- gam(
+  post_ep ~ te(pass_depth, ball_land_y_std, los_x_std, k = c(8, 8, 8)) + 
+            s(expected_points, k = 15),
+  family = scat(link = "identity"),
+  data = completed_passes_sym
+)
+
+summary(gam_model)
+
+gam.check(gam_model)
+
+# ---------------------------------------------------------
+# 3. Create Continuous Surface Grid (0.5yd resolution)
+# ---------------------------------------------------------
+mean_pre_ep <- mean(completed_passes_sym$expected_points, na.rm = TRUE)
+
+target_los <- 80
+
+pred_grid <- expand.grid(
+  los_x_std = target_los,
+  pass_depth = seq(-10, 45, by = 0.5),
+  ball_land_y_std = seq(1, 52.3, by = 0.5),
+  expected_points = mean_pre_ep
+) %>% 
+  # Eliminate impossible passes that land beyond the back of the endzone (110 yards)
+  filter((los_x_std + pass_depth) <= 110)
+
+# Predict updated Post-EP and Expected Points Added (EPA)
+pred_grid$predicted_post_ep <- predict(gam_model, newdata = pred_grid)
+pred_grid$predicted_epa     <- pred_grid$predicted_post_ep - mean_pre_ep
+
+# ---------------------------------------------------------
+# 4. Plot Continuous Field Value Surface
+# ---------------------------------------------------------
+ggplot(pred_grid, aes(x = pass_depth, y = ball_land_y_std)) +
+  # Continuous interpolated surface
+  geom_raster(aes(fill = predicted_epa), interpolate = TRUE) +
+  
+  # Value Contour Lines
+  geom_contour(aes(z = predicted_epa), color = "white", alpha = 0.25, bins = 12) +
+  
+  # Line of Scrimmage Line (x = 0)
+  geom_vline(xintercept = 0, color = "#4A90E2", linewidth = 1.2, linetype = "dashed") +
+  annotate("text", x = 1, y = 50, label = paste0("Line of Scrimmage = ", target_los), color = "#4A90E2", fontface = "bold", hjust = 0) +
+  
+  # Midfield Hash Line (y = 26.65)
+  geom_hline(yintercept = 26.65, color = "white", alpha = 0.3, linetype = "dotted") +
+  
+  # Diverging Color Palette (Blue = Below average, Slate = 0, Red = High EPA)
+  scale_fill_gradient2(
+    low = "#3B82F6", 
+    mid = "#1E293B", 
+    high = "#EF4444", 
+    midpoint = 0, 
+    name = "Expected EPA"
+  ) +
+  
+  # Formatting & Styling
+  coord_fixed(ratio = 1) +
+  labs(
+    title = "Symmetric Passing Field Value Model (xEPA Surface)",
+    subtitle = "2D Tensor Product GAM: Spatial Completion Value (Controlled for Pre-Play EP)",
+    x = "Pass Depth relative to Line of Scrimmage (Yards)",
+    y = "Field Width (Yards)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.background = element_rect(fill = "#0f172a", color = NA),
+    panel.background = element_rect(fill = "#0f172a", color = NA),
+    text = element_text(color = "white"),
+    axis.text = element_text(color = "gray80"),
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", size = 16)
+  )
+
+```
+
+```{r}
+saveRDS(gam_model, file = "gam_field_value_model.rds")
+```

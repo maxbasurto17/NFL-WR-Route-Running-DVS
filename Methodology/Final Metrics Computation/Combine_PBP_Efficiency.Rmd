@@ -1,0 +1,134 @@
+---
+title: "Combine_PBP_Efficiency"
+output: html_document
+---
+
+```{r}
+Palmer <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/Palmer_play_coverage_efficiency.csv")
+Godwin <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/Godwin_play_coverage_efficiency.csv")
+Devonta <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/Devonta_play_coverage_efficiency.csv")
+Jefferson <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/Jefferson_play_coverage_efficiency.csv")
+Metcalf <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/Metcalf_play_coverage_efficiency.csv")
+Olave <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/Olave_play_coverage_efficiency.csv")
+Pickens <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/Pickens_play_coverage_efficiency.csv")
+Davantae <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/Davantae_play_coverage_efficiency.csv")
+Pittman <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/Pittman_play_coverage_efficiency.csv")
+Diggs <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/Diggs_play_coverage_efficiency.csv")
+Jamarr <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/Jamarr_Chase_play_coverage_efficiency.csv")
+Keenan <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/Keenan_Allen_play_coverage_efficiency.csv")
+Amari <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/Amari_Cooper_play_coverage_efficiency.csv")
+Nico <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/Nico_Collins_play_coverage_efficiency.csv")
+Aiyuk <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/Aiyuk_play_coverage_efficiency.csv")
+Moore <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/DJ_Moore_play_coverage_efficiency.csv")
+AJB <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/AJB_play_coverage_efficiency.csv")
+Puka <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/Puka_play_coverage_efficiency.csv")
+ARSB <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/ARSB_play_coverage_efficiency.csv")
+Lamb <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/CD_Lamb_play_coverage_efficiency.csv")
+Tyreek <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/Tyreek_Hill_play_coverage_efficiency.csv")
+Evans <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/Mike_Evans_play_coverage_efficiency.csv")
+
+full_data <- read.csv("~/Documents/Football_R/CMSAC--Field Value/full_data.csv")
+player_ids <- full_data %>% 
+  select(nfl_id, player_name) %>% 
+  distinct()
+
+library(tidyverse)
+```
+
+```{r}
+Palmer <- Palmer %>% 
+  mutate(nfl_id = 56056 ,
+         player_name = "Trey Palmer")
+
+Godwin <- Godwin %>% 
+  mutate(nfl_id = 44896,
+         player_name = "Chris Godwin")
+
+Devonta <- Devonta %>% 
+  mutate(nfl_id = 53439,
+         player_name = "Devonta Smith")
+
+Jefferson <- Jefferson %>% 
+  mutate(nfl_id = 52430,
+         player_name = "Justin Jefferson")
+
+Metcalf <- Metcalf %>% 
+  mutate(nfl_id = 47847,
+         player_name = "DK Metcalf")
+
+Olave <- Olave %>% 
+  mutate(nfl_id = 54476,
+         player_name = "Chris Olave")
+
+Pickens <- Pickens %>% 
+  mutate(nfl_id = 54517,
+         player_name = "George Pickens")
+
+Pittman <- Pittman %>% 
+  mutate(nfl_id = 52442,
+         player_name = "Michael Pittman")
+
+Davantae <- Davantae %>% 
+  mutate(nfl_id = 41282,
+         player_name = "Davantae Adams")
+
+Diggs <- Diggs %>% 
+  mutate(nfl_id = 42489,
+         player_name = "Stefon Diggs")
+
+Aiyuk <- Aiyuk %>% 
+  mutate(nfl_id = 52433,
+         player_name = "Brandon Aiyuk")
+
+AJB <- AJB %>% 
+  mutate(nfl_id = 47834,
+         player_name = "AJ Brown")
+
+Amari <- Amari %>% 
+  mutate(nfl_id = 42347,
+         player_name = "Amari Cooper")
+
+ARSB <- ARSB %>% 
+  mutate(nfl_id = 53541,
+         player_name = "Amon-Ra St Brown")
+
+Evans <- Evans %>% 
+  mutate(nfl_id = 41233,
+         player_name = "Mike Evans")
+
+Jamarr <- Jamarr %>% 
+  mutate(nfl_id = 53434,
+         player_name = "Jamarr Chase")
+
+Keenan <- Keenan %>% 
+  mutate(nfl_id = 40024,
+         player_name = "Keenan Allen")
+
+Lamb <- Lamb %>% 
+  mutate(nfl_id = 52425,
+         player_name = "CeeDee Lamb")
+
+Moore <- Moore %>% 
+  mutate(nfl_id = 46093,
+         player_name = "DJ Moore")
+
+Nico <- Nico %>% 
+  mutate(nfl_id = 53518,
+         player_name = "Nico Collins")
+
+Puka <- Puka %>% 
+  mutate(nfl_id = 56042,
+         player_name = "Puka Nacua")
+
+Tyreek <- Tyreek %>% 
+  mutate(nfl_id = 43454,
+         player_name = "Tyreek Hill")
+
+
+```
+
+```{r}
+all_plays <- rbind(Palmer, Godwin, Devonta, Jefferson, Metcalf, Olave, Pickens, Davantae, Pittman, Diggs, Jamarr, Keenan, Amari, Nico, Aiyuk, Moore, AJB, Puka, ARSB, Lamb, Tyreek, Evans)
+
+write.csv(all_plays, "~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/top20_pbp_efficiency.csv")
+```

@@ -1,0 +1,485 @@
+---
+title: "Dangerous Viable Space Animation"
+output:
+  html_document:
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# 1. Libraries & Configuration
+
+```{r config}
+library(tidyverse)
+library(gganimate)
+library(htmltools)
+library(jsonlite)
+library(base64enc)
+
+# ---- File locations (both files live in the working directory) --------------
+grid_path     <- "~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/Mike_Evans_grid_cov_2games.csv"
+tracking_path <- "~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/full_data.csv"
+
+# ---- Receiver ---------------------------------------------------------------
+target_receiver_id <- 41233   # Mike Evans
+
+# ---- What gets drawn --------------------------------------------------------
+# Every cell inside the reasonable-pass envelope is colored by its efficiency
+# on a continuous white -> pink -> red gradient (the "danger gradient").
+fill_limits <- c(0, 1)   # efficiency range of the color scale (values are squished into it)
+fill_mid    <- 0.25        # midpoint of the gradient (pink)
+show_ball_landing <- TRUE  # orange X at the ball landing spot (if the columns exist)
+
+# ---- RTE definition (no thresholds) -----------------------------------------
+# Cell efficiency (already in the grid file) = sign(epa) * sqrt(|epa|) * ppcf_att^2,
+# zeroed behind the QB dropback. Frame RTE = SUM of cell efficiency over every
+# cell inside the reasonable-pass envelope (in_target_zone). This is the same
+# frame_efficiency used in the original SingleWR_Cov_Eff notebook.
+# mRTE = running max of frame RTE, aRTE = running mean of frame RTE.
+
+# ---- Dropdown / file size ---------------------------------------------------
+default_play <- 1   # which play (row of `play_list`) is showing when the page opens
+frame_step   <- 1   # 1 = every frame; 2 = every 2nd frame, etc. (smaller file).
+                    # mRTE / aRTE are always computed on ALL frames.
+embed_in_knit <- TRUE  # FALSE = only write the standalone .html (lighter knit)
+
+# ---- Render settings --------------------------------------------------------
+anim_width  <- 1280
+anim_height <- 720
+anim_fps    <- 10
+
+# Grid cell geometry (matches build_nfl_grid: 120 x 53.3 yds, 120 x 54 cells)
+cell_w    <- 120  / 119
+cell_h    <- 53.3 / 53
+```
+
+# 2. Load Data
+
+```{r load}
+grid_cols <- c("game_id", "play_id", "frame_id", "x", "y",
+               "ppcf_att", "in_target_zone", "epa", "efficiency")
+
+track_cols <- c("game_id", "play_id", "frame_id", "nfl_id",
+                "x_std", "y_std", "s", "dir_std",
+                "player_side", "player_position",
+                "play_direction", "absolute_yardline_number", "yards_to_go",
+                "home_team_abbr", "visitor_team_abbr", "quarter",
+                "play_description")
+
+grid_all <- read_csv(grid_path, col_select = any_of(grid_cols),
+                     show_col_types = FALSE)
+full_df  <- read_csv(tracking_path,
+                     col_select = any_of(c(track_cols, "ball_land_x_std", "ball_land_y_std")),
+                     show_col_types = FALSE)
+
+missing_grid  <- setdiff(grid_cols, names(grid_all))
+missing_track <- setdiff(track_cols, names(full_df))
+if (length(missing_grid) > 0)  stop("Missing in grid file: ",     paste(missing_grid,  collapse = ", "))
+if (length(missing_track) > 0) stop("Missing in tracking file: ", paste(missing_track, collapse = ", "))
+```
+
+# 3. Play List
+
+```{r play-list}
+# These are the plays that appear in the dropdown (in this order).
+play_list <- tribble(
+  ~game_id,    ~play_id,
+  2023091004,  695,
+  2023091004,  2607,
+  2023091004,  2505,
+  2024010705,  1462,
+  2024010705,  80,
+  2023091004,  196,
+  2023091004,  2177,
+  2023091004,  2154,
+  2024010705,  3462,
+  2024010705,  3000
+)
+
+# Keep only these plays in memory
+grid_all <- grid_all %>% semi_join(play_list, by = c("game_id", "play_id"))
+full_df  <- full_df  %>% semi_join(play_list, by = c("game_id", "play_id"))
+
+print(play_list)
+```
+
+# 4. Build One Play (data + plot + frames)
+
+`build_play()` takes one game/play and returns everything the dropdown needs: a
+readable label, the frame IDs, the rendered frames, and a summary row.
+
+```{r build-function}
+build_play <- function(gid, pid) {
+
+  # ---- Grid for this play ---------------------------------------------------
+  play_grid <- grid_all %>%
+    filter(game_id == gid, play_id == pid) %>%
+    mutate(
+      frame_id       = as.numeric(frame_id),
+      in_target_zone = coalesce(in_target_zone, FALSE)
+    )
+  if (nrow(play_grid) == 0) stop("No grid rows for this play.")
+
+  # ---- Frame-level RTE (computed on ALL frames) -----------------------------
+  frame_stats_all <- play_grid %>%
+    group_by(frame_id) %>%
+    summarize(
+      frame_rte = sum(efficiency[in_target_zone], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(frame_id) %>%
+    mutate(
+      m_rte    = cummax(frame_rte),
+      a_rte    = cummean(frame_rte),
+      lab_peak = sprintf("mRTE (To Date):\n%.2f", m_rte),
+      lab_avg  = sprintf("aRTE (To Date):\n%.2f", a_rte)
+    )
+
+  # Frames actually drawn (optionally thinned; always keep the last frame)
+  all_ids   <- frame_stats_all$frame_id
+  frame_ids <- sort(unique(c(all_ids[seq(1, length(all_ids), by = frame_step)],
+                             all_ids[length(all_ids)])))
+  frame_stats <- frame_stats_all %>% filter(frame_id %in% frame_ids)
+  n_frames    <- length(frame_ids)
+
+  # ---- Play metadata --------------------------------------------------------
+  play_meta <- full_df %>%
+    filter(game_id == gid, play_id == pid) %>%
+    slice(1) %>%
+    mutate(
+      los_x_std        = if_else(play_direction == "left",
+                                 120 - absolute_yardline_number,
+                                 absolute_yardline_number),
+      first_down_x_std = los_x_std + yards_to_go
+    )
+
+  abs_yardline <- play_meta$los_x_std
+  first_down_x <- play_meta$first_down_x_std
+
+  # Readable label for the dropdown: [AWAY @ HOME] Q# (clock) description
+  play_label <- sprintf("[%s @ %s] Q%s %s",
+                        play_meta$visitor_team_abbr, play_meta$home_team_abbr,
+                        play_meta$quarter, play_meta$play_description)
+
+  # Title drawn on the animation
+  play_title_text <- str_wrap(
+    paste0("Home: ", play_meta$home_team_abbr,
+           "; Away: ", play_meta$visitor_team_abbr,
+           "; (Q", play_meta$quarter, ") ",
+           play_meta$play_description),
+    width = 85
+  )
+
+  # ---- Player tracking ------------------------------------------------------
+  player_data <- full_df %>%
+    filter(
+      game_id == gid, play_id == pid,
+      frame_id %in% frame_ids,
+      nfl_id == target_receiver_id |
+        tolower(player_position) == "qb" |
+        tolower(player_side) == "defense"
+    ) %>%
+    mutate(
+      frame_id    = as.numeric(frame_id),
+      player_side = tolower(player_side),
+      dir_rad     = dir_std * pi / 180,
+      vx          = s * sin(dir_rad),
+      vy          = s * cos(dir_rad)
+    ) %>%
+    filter(!is.na(x_std), !is.na(y_std), !is.na(vx), !is.na(vy))
+
+  target_wr_data <- player_data %>% filter(nfl_id == target_receiver_id)
+
+  # ---- Danger gradient layer ------------------------------------------------
+  gradient_cells <- play_grid %>%
+    filter(in_target_zone, !is.na(efficiency), frame_id %in% frame_ids) %>%
+    transmute(frame_id, x, y, efficiency = pmax(efficiency, 0))  # negative EPA -> 0 (white)
+
+  # ---- Optional ball landing spot -------------------------------------------
+  has_landing <- show_ball_landing &&
+    all(c("ball_land_x_std", "ball_land_y_std") %in% names(play_meta)) &&
+    !is.na(play_meta$ball_land_x_std) && !is.na(play_meta$ball_land_y_std)
+  ball_land <- if (has_landing) tibble(x = play_meta$ball_land_x_std,
+                                       y = play_meta$ball_land_y_std) else NULL
+
+  # ---- Plot -----------------------------------------------------------------
+  ymin <- 0; ymax <- 53.3
+  banner_top <- ymax + 7   # height of the title banner above the field
+
+  p <- ggplot() +
+    # Field
+    annotate("rect", xmin = 0,   xmax = 120, ymin = ymin, ymax = ymax, fill = "#1e7a3a") +
+    annotate("rect", xmin = 0,   xmax = 10,  ymin = ymin, ymax = ymax, fill = "#135c29") +
+    annotate("rect", xmin = 110, xmax = 120, ymin = ymin, ymax = ymax, fill = "#135c29") +
+    geom_vline(xintercept = seq(10, 110, by = 5),  color = "white", alpha = 0.5) +
+    geom_vline(xintercept = seq(10, 110, by = 10), color = "white", linewidth = 1) +
+    # Line of scrimmage (black) & first-down marker (yellow)
+    annotate("segment", x = abs_yardline, xend = abs_yardline,
+             y = ymin, yend = ymax, color = "black",  linewidth = 1.2) +
+    annotate("segment", x = first_down_x, xend = first_down_x,
+             y = ymin, yend = ymax, color = "yellow", linewidth = 1.2) +
+    # Title banner above the field
+    annotate("rect", xmin = 0, xmax = 142, ymin = ymax, ymax = banner_top, fill = "#0f172a") +
+    annotate("text", x = 71, y = (ymax + banner_top) / 2,
+             label = "Focus Receiver is Always Mike Evans",
+             color = "white", fontface = "bold", size = 9) +
+    # Dashboard panel
+    annotate("rect", xmin = 121, xmax = 142, ymin = ymin, ymax = ymax, fill = "#0f172a") +
+    annotate("text", x = 131.5, y = 50, label = "RTE METRICS",
+             color = "white", fontface = "bold", size = 5) +
+    annotate("segment", x = 123, xend = 140, y = 47.5, yend = 47.5,
+             color = "white", alpha = 0.3)
+
+  # Danger gradient (only added when it has rows, so gganimate never sees an empty layer)
+  if (nrow(gradient_cells) > 0) {
+    p <- p +
+      geom_tile(data = gradient_cells,
+                aes(x = x, y = y, fill = efficiency),
+                width = cell_w, height = cell_h, alpha = 0.75) +
+      scale_fill_gradient2(
+        low = "white", mid = "lightpink", high = "#dc2626",
+        midpoint = fill_mid, limits = fill_limits, oob = scales::squish,
+        name = "Route Threat\nEfficiency"
+      )
+  }
+
+  # Ball landing spot (orange X with black outline)
+  if (!is.null(ball_land)) {
+    p <- p +
+      geom_point(data = ball_land, aes(x = x, y = y),
+                 shape = 4, size = 6, stroke = 3.2, color = "black") +
+      geom_point(data = ball_land, aes(x = x, y = y),
+                 shape = 4, size = 6, stroke = 1.6, color = "#f97316")
+  }
+
+  p <- p +
+    # Dashboard values (one row per drawn frame)
+    geom_text(data = frame_stats, aes(x = 131.5, y = 35, label = lab_peak),
+              color = "#4ade80", fontface = "bold", size = 5.6, lineheight = 0.95) +
+    geom_text(data = frame_stats, aes(x = 131.5, y = 23, label = lab_avg),
+              color = "#38bdf8", fontface = "bold", size = 5.6, lineheight = 0.95) +
+    # Movement vectors
+    geom_segment(data = player_data,
+                 aes(x = x_std, y = y_std,
+                     xend = x_std + vx * 1.8, yend = y_std + vy * 1.8,
+                     color = player_side),
+                 arrow = arrow(length = unit(0.25, "cm")), linewidth = 1.1) +
+    # Players
+    geom_point(data = player_data, aes(x = x_std, y = y_std),
+               size = 4.5, color = "black") +
+    geom_point(data = player_data, aes(x = x_std, y = y_std, color = player_side),
+               size = 3.2) +
+    # White ring around the target receiver
+    geom_point(data = target_wr_data, aes(x = x_std, y = y_std),
+               shape = 21, size = 6, stroke = 1.2, fill = NA, color = "white") +
+    scale_color_manual(values = c("offense" = "#facc15", "defense" = "#3b82f6"),
+                       name = "Team") +
+    coord_fixed(xlim = c(0, 142), ylim = c(0, banner_top), expand = FALSE) +
+    theme_minimal() +
+    theme(
+      panel.grid      = element_blank(),
+      axis.title      = element_blank(),
+      axis.text       = element_blank(),
+      legend.position = "bottom",
+      plot.title      = element_text(size = 20, face = "bold", lineheight = 1.05)
+    ) +
+    labs(title = paste0(play_title_text, "\nFrame: {current_frame}")) +
+    transition_manual(frame_id)
+
+  # ---- Render frames to a temp folder, then encode as base64 ----------------
+  frame_dir <- file.path(tempdir(), sprintf("dvs_frames_%s_%s", gid, pid))
+  if (dir.exists(frame_dir)) unlink(frame_dir, recursive = TRUE)
+  dir.create(frame_dir, showWarnings = FALSE)
+
+  invisible(animate(
+    p,
+    nframes  = n_frames,
+    fps      = anim_fps,
+    width    = anim_width,
+    height   = anim_height,
+    device   = "png",
+    renderer = file_renderer(dir = frame_dir, prefix = "space_frame_", overwrite = TRUE)
+  ))
+
+  raw_files   <- list.files(frame_dir, pattern = "^space_frame_.*\\.png$", full.names = TRUE)
+  frame_files <- stringr::str_sort(raw_files, numeric = TRUE)
+  if (length(frame_files) != n_frames) {
+    stop(sprintf("Rendered %d images but expected %d frames.", length(frame_files), n_frames))
+  }
+
+  frames_b64 <- vapply(frame_files,
+                       function(f) base64enc::dataURI(file = f, mime = "image/png"),
+                       character(1))
+  unlink(frame_dir, recursive = TRUE)
+
+  list(
+    label     = play_label,
+    frame_ids = frame_ids,
+    frames    = unname(frames_b64),
+    summary   = tibble(
+      play            = play_label,
+      frames          = nrow(frame_stats_all),
+      peak_frame_rte  = max(frame_stats_all$frame_rte),
+      avg_frame_rte   = mean(frame_stats_all$frame_rte),
+      final_frame_rte = last(frame_stats_all$frame_rte),
+      peak_frame_id   = frame_stats_all$frame_id[which.max(frame_stats_all$frame_rte)]
+    )
+  )
+}
+```
+
+# 5. Render Every Play in the List
+
+```{r render-all}
+play_results <- vector("list", nrow(play_list))
+
+for (i in seq_len(nrow(play_list))) {
+  message(sprintf("Rendering play %d of %d (game %s, play %s)...",
+                  i, nrow(play_list), play_list$game_id[i], play_list$play_id[i]))
+  play_results[[i]] <- tryCatch(
+    build_play(play_list$game_id[i], play_list$play_id[i]),
+    error = function(e) {
+      warning(sprintf("Skipping game %s play %s: %s",
+                      play_list$game_id[i], play_list$play_id[i], conditionMessage(e)))
+      NULL
+    }
+  )
+}
+
+play_results <- compact(play_results)
+if (length(play_results) == 0) stop("No plays could be rendered.")
+default_play <- min(default_play, length(play_results))
+
+rm(grid_all, full_df); invisible(gc())
+```
+
+# 6. Interactive Player (Play Dropdown + Play Button + Scrubber)
+
+```{r widget, results='asis'}
+# Dropdown options show the play description
+option_html <- paste0(
+  '<option value="', seq_along(play_results) - 1, '">',
+  vapply(play_results, function(r) htmlEscape(r$label), character(1)),
+  '</option>',
+  collapse = ""
+)
+
+# All plays' labels, frame IDs and frames as one JSON array
+plays_json <- as.character(toJSON(
+  lapply(play_results, function(r) list(label  = r$label,
+                                        ids    = I(r$frame_ids),
+                                        frames = I(r$frames))),
+  auto_unbox = TRUE
+))
+
+widget_head <- '
+<div id="ds_wrap" style="width: 950px; max-width: 100%; margin: 0 auto; text-align: center; font-family: sans-serif;">
+  <div style="display: flex; align-items: center; gap: 10px; background: #0f172a; padding: 10px 18px; border-radius: 8px; color: white; margin-bottom: 10px;">
+    <label for="ds_select" style="font-weight: bold; white-space: nowrap;">Select play:</label>
+    <select id="ds_select" style="flex: 1; min-width: 0; padding: 6px; border-radius: 4px; font-size: 14px;">__OPTIONS__</select>
+  </div>
+  <div style="margin-bottom: 8px;">
+    <img id="ds_img" src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" style="width: 100%; height: auto; border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.15);" />
+  </div>
+  <div style="display: flex; align-items: center; justify-content: center; gap: 12px; background: #0f172a; padding: 10px 18px; border-radius: 8px; color: white; flex-wrap: wrap;">
+    <button id="ds_play" style="padding: 6px 16px; background: #3b82f6; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; min-width: 70px;">Play</button>
+    <button id="ds_prev" title="Previous frame" style="padding: 6px 10px; background: #334155; color: white; border: none; border-radius: 4px; cursor: pointer;">&#9664;</button>
+    <button id="ds_next" title="Next frame" style="padding: 6px 10px; background: #334155; color: white; border: none; border-radius: 4px; cursor: pointer;">&#9654;</button>
+    <span style="font-weight: bold; font-size: 14px;">Frame ID: <span id="ds_frame_val"></span></span>
+    <input type="range" id="ds_slider" min="0" max="0" value="0" step="1" style="flex: 1; min-width: 200px; cursor: pointer;" />
+    <select id="ds_speed" style="padding: 4px; border-radius: 4px;">
+      <option value="0.5">0.5x</option>
+      <option value="1" selected>1x</option>
+      <option value="2">2x</option>
+    </select>
+  </div>
+</div>
+
+<script>
+(function() {
+  var plays = '
+
+widget_tail <- ';
+  var startPlay = __DEFAULT__;
+  var cur   = 0;
+  var idx   = 0;
+  var timer = null;
+
+  var img    = document.getElementById("ds_img");
+  var val    = document.getElementById("ds_frame_val");
+  var slider = document.getElementById("ds_slider");
+  var btn    = document.getElementById("ds_play");
+  var speed  = document.getElementById("ds_speed");
+  var sel    = document.getElementById("ds_select");
+
+  function show(i) {
+    var n = plays[cur].frames.length;
+    idx = ((i % n) + n) % n;
+    img.src = plays[cur].frames[idx];
+    val.innerText = plays[cur].ids[idx];
+    slider.value = idx;
+  }
+
+  function stop() {
+    if (timer) { clearInterval(timer); timer = null; }
+    btn.innerText = "Play";
+  }
+
+  function start() {
+    stop();
+    btn.innerText = "Pause";
+    var ms = 100 / parseFloat(speed.value);
+    timer = setInterval(function() { show(idx + 1); }, ms);
+  }
+
+  function loadPlay(p) {
+    stop();
+    cur = p;
+    slider.max = plays[cur].frames.length - 1;
+    // Preload only the selected play so switching stays fast and flicker-free
+    plays[cur].frames.forEach(function(src) { var im = new Image(); im.src = src; });
+    show(0);
+  }
+
+  sel.addEventListener("change", function() { loadPlay(parseInt(this.value)); });
+  btn.addEventListener("click", function() { timer ? stop() : start(); });
+  slider.addEventListener("input", function() { stop(); show(parseInt(this.value)); });
+  document.getElementById("ds_prev").addEventListener("click", function() { stop(); show(idx - 1); });
+  document.getElementById("ds_next").addEventListener("click", function() { stop(); show(idx + 1); });
+  speed.addEventListener("change", function() { if (timer) start(); });
+
+  sel.value = startPlay;
+  loadPlay(startPlay);
+})();
+</script>
+'
+
+widget_head <- sub("__OPTIONS__", option_html, widget_head, fixed = TRUE)
+widget_tail <- sub("__DEFAULT__", as.character(default_play - 1), widget_tail, fixed = TRUE)
+widget_html <- paste0(widget_head, plays_json, widget_tail)
+
+# Show in the knitted document
+if (embed_in_knit) {
+  cat(widget_html)
+} else {
+  cat("The animation was saved as a standalone file (see below).")
+}
+
+# Also save a standalone HTML file
+out_file <- "dangerous_space_all_plays.html"
+writeLines(
+  paste0("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Dangerous Viable Space</title></head><body style='background:#f8fafc;'>",
+         widget_html, "</body></html>"),
+  out_file
+)
+message("Saved standalone animation to: ", normalizePath(out_file))
+```
+
+# 7. Play Summary
+
+```{r summary}
+bind_rows(lapply(play_results, `[[`, "summary")) %>%
+  knitr::kable(digits = 2, caption = "aRTE / mRTE summary by play")
+```

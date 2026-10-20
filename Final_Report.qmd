@@ -1,0 +1,271 @@
+---
+title: "Dangerous Viable Space (DVS): A Spatial Control Framework for Quantifying NFL Wide Receiver Route-Running Threat"
+author: "Max Basurto | Suhas Narra"
+date: today
+abstract: "In the NFL, route-running is one of a wide receiver’s (WR) most important skills. While current NFL wide receiver route-running metrics are often rudimentary and lack information about the threat of a given route, our research quantifies route-running ability by combining spatial control and expected threat. By applying Spearman’s soccer pitch control methodology (2017) to NFL tracking data, we created a physics-based, machine-learning-less model to identify WR and defensive back (DB) spatial control over the course of a pass play. To better understand the value of the space WRs control relative to DBs, we weight it by an xEPA model that assigns a threat value to each field location. This product yields the WR's Dangerous Viable Space (DVS) at each point in time. By taking the average and maximum of the wide receiver’s DVS, we can calculate both the receiver’s Average Route Threat Efficiency (aRTE) and Maximum Route Threat Efficiency (mRTE), respectively. By isolating wide receiver route-running ability from target share and throw outcome, aRTE and mRTE offer clearer metrics for evaluating downfield threat, scheme fit, and receiver archetypes.
+"
+format:
+  pdf:
+    documentclass: article
+    geometry:
+      - top=0.5in
+      - bottom=0.5in
+      - left=0.5in
+      - right=0.5in
+---
+
+# 1 Introduction & Literature Review
+
+In American football, evaluating a wide receiver’s (WR) route-running performance remains heavily polluted by downstream outcomes and lacks comprehensive metrics that evaluate all components of route running. Traditional box-score metrics, such as targets, yards per route run, and completion percentage, are fundamentally conditional on quarterback decision-making, offensive line protection, and play design. Modern Next Gen Stats tracking metrics evaluate receivers only at discrete static moments, such as separation at the time of ball arrival (NFL Next Gen Stats, n.d.). This raw separation misses the complete spatial picture; a receiver might have significant separation at release, only for a defender's closing speed to erase that gap almost immediately.
+
+This creates a critical analytical gap: a receiver who runs a crisp route and establishes leverage in high-value space receives zero or little credit if the quarterback progresses elsewhere. Meanwhile, a receiver who wins late against a blown coverage can accumulate inflated outcome metrics. To truly isolate route-running quality from team-level noise, an evaluation framework must continuously track spatial control, weight that space by its contextual scoring value, and bound the evaluation to physically realistic pass trajectories.
+
+To capture the contextual value of a route independently of whether it results in a catch, we build upon the Expected Points (EP) framework. Originally developed to estimate the "next score" from a given down, distance, and yard line (Carter and Machol 1971), EP evolved into Expected Points Added (EPA) to quantify the value of individual plays (Burke 2010) and isolate individual player contributions to team success (Yurko, Ventura, and Horowitz 2019). Our research extends this idea spatially, assigning a localized expected drive-value (xEPA) to every point on the grid based on historical passing data.
+
+To measure who actually controls those valuable locations, we adapt physics-based pitch control, originally developed to estimate soccer pass completion probabilities using player time-to-intercept (Spearman 2017). In soccer analytics, researchers have successfully combined this field control with expected goals (Spearman 2018; Fernandez and Bornn 2018) and developed metrics like Dangerous Accessible Space (Bischofberger and Baca 2025) to identify players generating valuable spatial opportunities.
+
+American football research has recently adopted pitch control to evaluate quarterback pressure (Inayatali, White, and Hocevar 2023) and quantify defensive pass coverage (Subbaiah, Chu, Reyers, and Wu 2021). While prior football research like Illuminating the Defense (Subbaiah et al., 2021) successfully weighted field control by applying a direct linear multiplication of spatial xEPA and pitch control, these applications have historically focused on defensive evaluation. No existing NFL framework combines spatial control with a threat-weighted field value specifically to isolate a wide receiver's downfield route-running threat.
+
+To fill this gap, we introduce Dangerous Viable Space (DVS). Instead of direct linear multiplication, DVS uses a non-linear transformation of xEPA and pitch control to better capture the risk-reward dynamics of NFL passing windows. Crucially, we restrict this evaluation exclusively to Reasonable Pass Bounds: a dynamically calculated Pareto frontier that isolates physically viable throw envelopes given player kinematics and throw geometry. By accumulating DVS across each frame of a route, we propose three novel, target-independent evaluation metrics:
+
+- **Average Route Threat Efficiency (aRTE)**: Quantifies a receiver’s ability to sustain control over high-value space throughout the duration of a route.
+
+- **Maximum Route Threat Efficiency (mRTE)**: Captures peak window-creation ability, measuring how effectively a receiver creates maximum threat during key timing windows. 
+
+- **Final Route Threat Efficiency (fRTE)**: Captures a receiver's ability to sustain a downfield threat at the exact moment of the throw.
+
+By stripping out target bias, play outcome variance, and screen-play execution noise, aRTE, mRTE, and fRTE provide coaches and front-office analysts with objective metrics for evaluating isolated WR skill, scheme fit, and receiver archetypes.
+
+The remainder of this paper is structured as follows: Section 2 outlines the NFL Big Data Bowl dataset and our data pipeline; Section 3 details the spatial xEPA field valuation model, the adapted physics-based pitch control model, and the Pareto-frontier pass bounds; Section 4 presents empirical results and validates the RTE metrics across player archetypes; and Section 5 discusses practical applications for NFL front offices and coaching staff.
+
+# 2 Data
+
+Data for this study are sourced from the open-access 2026 NFL Big Data Bowl dataset (NFL, 2025), comprising over 14,000 passing attempts from the 2023 NFL regular season. The dataset combines high-frequency spatial-temporal tracking captured at 10 Hz (10 observations per second) with rich play-level metadata. The tracking data records continuous positional coordinates ($x, y$), speed, acceleration, and orientation for all eligible receivers, defensive backs, and quarterbacks from the moment the ball is snapped until the pass is rendered complete or incomplete.  
+
+To ensure physical and spatial consistency across all plays, raw tracking coordinates were transformed into a standardized left-to-right offensive coordinate system ($x \in [0, 120]$, $y \in [0, 53.33]$ yards). This spatial normalization enforces directional invariance across kinematic vectors—such as velocity ($\vec{v}$), acceleration ($\vec{a}$), and orientation ($\theta$)—mapping every route onto a uniform $120 \times 54$ one-yard cellular grid regardless of drive direction or end zone orientation.
+
+Play-level metadata (down, distance, yardline, and baseline expected points) was joined with frame-level tracking via unique relational identifiers (gameId, playId, nflId). To systematically evaluate route execution, the temporal window for each play is partitioned into two distinct phases:  
+
+- **Pre-pass phase**: From ball snap to pass release, representing the core analytical window for evaluating continuous route-running threat generation.
+- **Post-pass phase**: From pass release to ball arrival or outcome, utilized primarily to calibrate pass trajectory bounds and completion probabilities.
+
+Plays designated as wide receiver screens, spikes, sacks, or pre-pass penalties were filtered out of the primary sample to isolate true downfield route execution from deliberate backfield design and play-breakdown noise.
+
+# 3 Methodology & Modeling Framework
+## 3.1 Field Control Model
+
+Our pitch control framework adapts William Spearman’s (2017) physics-based spatial ownership model to the specific kinematics of American football. Because the flight profile and arrival mechanics of an aerial football pass differ fundamentally from a soccer pass, we re-engineered the ball kinematics to map expected completion percentages continuously across the field.
+
+To isolate individual wide receiver route-running ability, the model evaluates a single targeted receiver against all secondary defenders on a uniform $120 \times 54$ grid of 1-yard by 1-yard cells. This approach strips away the noise of offensive scheme and supporting cast positioning to isolate a given WR's value creation.
+
+### Kinematics and Time-to-Intercept (TTI)
+
+Player movement toward any field coordinate is partitioned into an acceleration phase and a cruising phase. Current speed ($v_0$) is extracted from tracking data, while maximum velocity ($v_{max}$) and maximum acceleration ($a_{max}$) are dynamically bounded using each player's historical 99th-percentile tracking metrics. The distance a player can cover during their acceleration phase ($t_{acc}$) is calculated as $d_{acc} = v_0 t_{acc} + \frac{1}{2} a_{max} t_{acc}^2$.
+
+Each player's Time-to-Intercept ($TTI$) is computed based on whether they will reach maximum velocity before reaching the target point. 
+
+If the target distance $d \le d_{acc}$, the Time-to-Intercept ($TTI$) is solved via the quadratic equation:
+$$TTI = \frac{-v_0 + \sqrt{v_0^2 + 2a_{max}d}}{a_{max}}$$
+If the player reaches maximum velocity before arriving at the target, then the remainder of the distance is traversed at constant speed:
+$$TTI = t_{acc} + \frac{d - d_{acc}}{v_{max}}$$
+
+Ball flight times are determined by calculating the distance to the target and bounding the 2D velocity of the football ($v_{ball}$) between 14 yds/sec (lob passes) and 23 yds/sec (bullet passes), reflecting empirical 5th and 95th percentile NFL throw speeds. 2D velocity is captured because the data is limited to x and y coordinates; it is not feasible to measure the arc of the ball without a vertical z coordinate. In multi-receiver computations, the ball arrival time is calibrated to the receiver who arrives first, assuming optimal quarterback execution.
+
+### Spatial Control and Arrival Probability
+
+The probability of a player arriving at a target cell by time $t$ uses a logistic arrival model based on the difference between the current time and their $TTI$:
+$$P(t) = \frac{1}{1 + e^{-c (t - TTI)}}$$
+(where $c$ represents the logistic scaling variance constant). Field control is calculated iteratively across infinitesimally small time intervals ($dt$). As players approach the target, their exerted control accumulates. To govern this dynamic control surface, we enforce the following football-specific mechanical assumptions:
+
+- **Arrival-Dependent Control & Decay**: Player control over any field location remains strictly zero until the simulated pass reaches that location ($t < T_{\text{ball}}$). Once the ball arrives ($t \ge T_{\text{ball}}$), control accumulates dynamically over time step $dt$. As total accumulated control ($PPCF_{\text{tot}}$) approaches 100%, the available unallocated space ($(1 - PPCF_{\text{tot}})$) diminishes, making it exponentially harder for opposing players to usurp an already controlled cell.The incremental change in Pitch Control ($dPPCF$) is modeled as:
+$$dPPCF = \begin{cases} 0, & t < T_{\text{ball}} \\ (1 - PPCF_{\text{tot}}) \cdot (P(t) \cdot \lambda) \cdot dt, & t \ge T_{\text{ball}} \end{cases}$$
+where $T_{\text{ball}}$ is the time required for the football to reach the target cell, $P(t)$ is the player's logistic arrival probability, and $\lambda$ is their base control rate.
+
+- **Defensive Advantage ($\lambda$)**: Following Spearman’s (2018) foundational pitch control framework, the defensive control rate ($\lambda_{def}$) is scaled by a coefficient of $\kappa = 1.17$. Derived via Maximum Likelihood Estimation, this grants defenders a 17% spatial acquisition advantage, mathematically reflecting the empirical reality that disrupting a pass requires significantly less time and precision than catching and securing one. It is important to note that while Spearman's paper derived pitch control parameters for soccer, this framework uses coefficients optimized for football. 
+
+- **Forward Pass Masking**: Expected completion percentage is strictly masked to 0 for all spatial coordinates behind the quarterback ($x \le x_{qb}$). Backward passes mechanically function as run plays. Allowing receivers to accumulate spatial value behind the line of scrimmage would distort the evaluation of downfield route-running threat.
+
+- **Quarterback Exclusion**: The quarterback's spatial control rate ($\lambda_{qb}$) is permanently forced to 0. The quarterback cannot complete a pass to himself, so his tracking coordinates only serve as the geometric origin point for throw distance calculations.  
+
+![Field control visualization example.](~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/Plots/field_control_raw_sep_example.png){width=70% fig-align="center"}
+
+Figure 1 visualizes raw field control during a 2023 Week 4 Rams vs. Colts play. Despite high separation at the time of the throw, the receiver lacks control over the surrounding area, resulting in an incomplete pass. This illustrates how the field control mechanism captures continuous spatial dynamics, unlike traditional separation metrics that are limited to a discrete point in time.
+
+## 3.2 Field Value Model (xEPA)
+
+The field value model quantifies the magnitude of drive-specific Expected Points ($EP$) generated by isolating the specific context of a play independent of game-state noise like win probability. A 20-yard reception on 3rd & 15 carries identical intrinsic spatial value whether a team is tied or trailing by 30 points. To evaluate wide receivers independent of their supporting cast and overarching game state, Expected Points isolations best answer where and how much field position gains support a team's localized effort to score.
+
+### Data Architecture and Spatial Symmetry
+
+The response variable for the model is Post-Play Expected Points ($PostEP$), calculated by adding the realized Expected Points Added ($EPA$) to the pre-play Expected Points ($PreEP$). To prevent the model from learning artificial directional biases based on empirical dataset tendencies (e.g., right-handed quarterbacks preferring to throw to the right sideline), coordinate geometry is forced into strict symmetry. Prior to fitting, the spatial training data is duplicated and reflected across the field's longitudinal center. Every empirical pass coordinate is appended with a mirrored counterpart by transforming the vertical coordinate as $y_{mirrored} = 53.3 - y_{std}$.
+
+### Generalized Additive Model (GAM) Formulation
+
+To map continuous expected value across the field, the framework utilizes a Generalized Additive Model (GAM). The expected post-play value is modeled using a 3-dimensional tensor product smooth for the spatial parameters, while strictly controlling for pre-play expected points via a separate 1D marginal smooth.  
+
+The full model takes the form:
+$$\mathbb{E}[PostEP] = \beta_0 + f_{spatial}(x_{depth}, y_{land}, x_{los}) + f_{context}(PreEP)$$
+Where:
+- $f_{spatial}$ is a tensor product (te) constructed from marginal splines with basis dimension $k=8$ for pass depth ($x_{depth}$), transverse field location ($y_{land}$), and line of scrimmage ($x_{los}$). Pass depth is dynamically calculated relative to the line of scrimmage: $x_{depth} = x_{land} - x_{los}$.  
+- $f_{context}$ is a one-dimensional smooth (s) of the pre-play $PreEP$ with basis dimension $k=15$.  
+
+To robustly handle heavy-tailed residuals generated by structural edge cases (specifically low-frequency, explosive touchdown plays where the localized EP strictly jumps to 6) the model is fit using a Scaled t-distribution (scat) with an identity link function. Utilizing a heavy-tailed distribution prevents these extreme scoring outliers from aggressively pulling the spline bases and distorting the general route-value surface.  
+
+### Yield and Expected Points Added ($xEPA$)
+
+The continuous expected value surface is generated by interpolating predictions across a 0.5-yard resolution grid. The model actively bounds the evaluation space by masking out impossible spatial geometries, dropping any coordinates that land beyond the back of the endzone ($x_{los} + x_{depth} \le 110$).
+
+To isolate the expected spatial Expected Points Added ($xEPA$) at any specific grid coordinate, the average $PreEP$ of the play context is subtracted from the model's predicted $PostEP$:
+  $$xEPA(x, y) = \mathbb{E}[PostEP] - \overline{PreEP}$$
+By combining this continuous $xEPA$ surface with the kinematic pitch control matrices, the expected value of a receiver's spatial control can be evaluated on a frame-by-frame basis throughout the route.
+
+![xEPA Field Value Example](~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/Plots/field_value_surface.png){width=50% fig-align="center"}
+
+Figure 2 visualizes the xEPA for completed pass plays starting from the opponent’s 30 yardline. Intuitively, the xEPA increases gradually as the pass length increases, and horizontal change does not materially impact the xEPA of a pass. 
+
+## 3.3 Reasonable Pass Bounds
+
+To prevent evaluating defensive spatial control over physically unviable pass trajectories, the modeling evaluation space is constrained to a dynamically calculated Pareto boundary dubbed the Reasonable Pass Bounds. This spatial envelope establishes the domain of realistic pass landing locations given the target receiver’s route trajectory, velocity vector, and lookahead horizon at any given time.
+
+### Sample Filtering and Dynamic Categorization
+
+The calibration pipeline strictly isolates un-penalized, completed passes exclusively during the pre-pass phase. This filter was chosen to identify pass locations that had a reasonable chance of being completed. For instance, we deliberately remove throwaways, overthrown deep passes, and batted balls. Pass depth is dynamically calculated relative to the line of scrimmage utilizing the receiver's anchor coordinates at the exact throw frame (the maximum available pre-pass frame):
+  $$x_{\text{depth}} = x_{\text{anchor}} - x_{\text{los}}$$
+  
+Rather than utilizing static yardage cutoffs, route depths are partitioned dynamically into three discrete bins based on the sample mean ($\mu$) and standard deviation ($\sigma$) of the empirical release depths: Short ($< \mu - \sigma$), Medium ($[\mu - \sigma, \mu + \sigma]$), and Deep ($> \mu + \sigma$).
+
+### Route Geometry and Spatial Envelope Mechanics
+
+For a given lookahead horizon of $N$ frames post-current frame ($N \in \{5, 10, \dots, 30\}$), the receiver’s step speed ($v$) and movement unit vector are computed using their current frame diagnostics. A projected forward segment length ($L$) is extrapolated from the receiver's anchor point $(x_{\text{anchor}}, y_{\text{anchor}})$ by multiplying the step speed by the lookahead frame count:
+  $$L = v \times N$$
+The total spatial bounds around this trajectory are modeled as the union of two geometric regions:  
+
+- **Forward Corridor**: A tubular buffer extending along the projected route path with a lateral half-width $w$. A coordinate falls within the forward tube if its orthogonal distance to the projected segment satisfies $d_{\perp} \le w$, and its projected arc length along the path satisfies $0 \le s \le L$.  
+- **Backward Cushion Zone**: To account for underthrown adjustments, a rectangular cushion extends behind the throw anchor point along the inverse of the receiver's initial direction vector $\vec{u}$. A point falls in this backward zone if its longitudinal backward displacement satisfies $0 \le d_{\parallel, \text{back}} \le b$ and its perpendicular offset satisfies $d_{\perp, \text{back}} \le w$.  
+
+A pass coordinate is enclosed within the total spatial envelope if it falls into either the forward tube or the backward cushion zone. These limits are computed for each frame of the WR's route pre-throw.   
+
+### Stratified Grid Calibration and Optimization
+
+Parameters are optimized independently for each depth bin $k$ to account for kinematic variations across route depths utilizing a parallelized grid search. The search space evaluates backward cushions $b \in [0, 3]$ yards (step $0.5$), corridor widths $w \in [1, 6]$ yards (step $0.5$), and lookahead horizons $N$ tailored specifically to each depth bin. For each depth bin, the optimal parameter tuple $(b_k^*, w_k^*, N_k^*)$ minimizes the total envelope surface area ($Area$) while guaranteeing a target empirical pass coverage threshold $\alpha \ge 0.90$:
+$$\min_{w, b, N} \quad 2w (L + b) + \pi w^2 \quad \text{subject to} \quad \frac{1}{M_k} \sum_{i=1}^{M_k} \mathbb{I}_{\text{inside}, i} \ge 0.90$$
+  
+where $M_k$ is the total play count in bin $k$. The 90% minimum threshold was selected to strike an optimal balance: it captures the vast majority of historically realistic target locations while explicitly filtering out anomalous outliers. These outliers include severely deflected passes, egregious miscommunications, or highly improbable desperation throws that would otherwise artificially inflate the spatial envelope and dilute the accuracy of the defensive evaluation.
+
+To maintain physical consistency, corridor widths are constrained to be strictly monotonic across increasing depth bins utilizing a cumulative maximum function. This monotonic restriction ensures that deeper passes will be treated with more flexible reasonable pass bounds due to increased ball time in air and time for the receiver to reach the ball. Ultimately, our calibrated parameters successfully bound the target zones, yielding final empirical coverage rates of 90.9% for Short routes, 90.2% for Medium routes, and 85% for Deep routes.   
+
+![Reasonable Pass Bounds Examples](~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/Plots/reasonable_pass_bounds_examples.png){width=70% fig-align="center"}
+
+As illustrated in Figure 3, the resulting spatial envelopes dynamically scale with target depth, expanding from a tight 2-yard width on Short targets to 4.5 yards on Medium targets, and reaching 6 yards on Deep throws. In each representative case, the actual pass landing location (red "X") falls cleanly within the boundary calibrated from the receiver's pre-throw trajectory (solid line) and position at release (orange dot). By appropriately expanding the corridor as route depth and air time increase, this approach successfully isolates physically viable target zones without overestimating the receiver's reachable area.
+
+### Residual Diagnostics
+
+Spatial residual errors are decomposed into perpendicular lateral errors ($r_{\perp} = d_{\perp}$) and longitudinal depth errors relative to the projected line segment ($r_{\parallel} = s - L$). Diagnostic evaluation confirms that the vast majority of longitudinal residuals are negative, demonstrating that the projected forward segment acts as an effective upper bound that successfully encloses all catchable targets.  
+
+Variance across route depths relative to the line of scrimmage is assessed using non-parametric LOESS smoothing. The smoothing demonstrates general stability across most route depths, although localized variance and structural shifts emerge within the 10-to-20-yard intermediate range. These shifts are due to the use of discrete bucketing, wherein routes that barely cross into the next depth threshold may have larger than realistic bounds since they fall in the shallower end of a deep pass bucket.  
+
+The overall distribution of lateral errors is evaluated utilizing density histograms and normal Q-Q plots of model residuals. Rather than confirming normality, these diagnostics reveal a heavily right-skewed distribution; the distribution exhibits a hard lower bound near zero and a significant upward deviation from theoretical normal quantiles, reflecting a long tail of extreme lateral outliers. This heavy tail supports the use of empirical thresholds via grid search rather than linear models to set parameters for reasonable pass bounds.
+
+## 3.4 Dangerous Viable Space (DVS) 
+
+Dangerous Viable Space (DVS) represents the mathematical synthesis of the kinematic field control model and the continuous expected points surface. To calculate the localized threat generated by a receiver at any discrete field coordinate $(x, y)$, the framework computes a combined metric integrating spatial ownership with the intrinsic expected scoring value of that specific location.
+
+This framework forgoes the direct linear multiplication of spatial Expected Points Added ($xEPA$) and offensive Pitch Control Probability ($PPCF_{att}$) utilized in prior models such as Illuminating the Defense (Subbaiah et al., 2021). Instead, the model applies a specific non-linear transformation to better capture the risk-reward dynamics of NFL passing windows. The raw spatial efficiency at each grid cell is modeled as:
+
+  $$DVS(x, y) = \text{sign}(xEPA) \cdot \sqrt{\vert{}xEPA\vert{}} \cdot PPCF_{att}^2$$
+  
+Taking the square root of the absolute $xEPA$ dampens extreme fluctuations in deep-field point values, while squaring the offensive control probability ($PPCF_{att}$) aggressively penalizes heavily contested or weakly controlled space. This transformation strictly rewards receivers who establish dominant leverage in positive-value areas rather than receivers who are in high-value locations with little spatial control. To ensure the metric strictly evaluates downfield route-running threat, DVS is subjected to rigid spatial masking. Any calculated efficiency value located behind the quarterback's dropback position is zeroed out, preventing lateral or backward movement behind the line of scrimmage from artificially deflating a receiver's spatial score.
+
+With the continuous DVS surface established, these cellular values are aggregated to evaluate route execution dynamically across time. For any given frame $t$ during the pre-pass phase, the receiver's aggregate Frame Efficiency (Frame DVS) is calculated by summing the DVS values across all valid spatial cells within the targeted evaluation zone:
+
+$$Frame DVS_t = \sum_{(x,y) \in \text{Target Zone}} DVS(x, y, t)$$
+
+From this continuous array of frame-level threat generation, the model extracts two primary play-level evaluation metrics to quantify route-running proficiency independent of quarterback targets:  
+
+- **Average Route Threat Efficiency (aRTE)**: Calculated as the mean Frame DVS across all analyzed pre-pass frames. This metric quantifies a receiver’s baseline ability to sustain high-value spatial control throughout the entire duration of a route's development. 
+- **Maximum Route Threat Efficiency (mRTE)**: Isolated as the peak (maximum) Frame DVS achieved at any point during the pre-pass lifecycle. This captures a receiver's peak window-creation ability, measuring their capacity to generate explosive threat at the optimal timing of a play
+- **Final Route Threat Efficiency (fRTE)**: Computed as the Frame DVS at the time of throw. This reflects a receiver's route-finishing capability, evaluating how much spatial control and drive-value potential they maintain at the exact window of opportunity.
+
+![Dangerous Viable Space (DVS) Example](~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/Plots/Mike_Evans_TD_DVS_plot.png){width=70% fig-align="center"}
+
+Figure 4 illustrates this framework in action during a 28-yard touchdown pass to Mike Evans. At the exact frame of pass release, corresponding to the Final Route Threat Efficiency (fRTE) metric, Evans' route leverage and speed vector (yellow dot and arrow) establish a dominant, high-efficiency corridor (shaded red) extending well past the line of scrimmage (black line) and the line to gain (yellow line). Notably, the actual ball landing spot (indicated by the "X") falls directly within the highest concentration of threat efficiency, demonstrating how Evans effectively cleared defensive leverage to create valuable targetable space.
+
+# 4 Metric Validation
+
+To evaluate the empirical validity and practical utility of our Route Threat Efficiency metrics, we analyze continuous tracking data across the top 20 wide receivers from the 2023 NFL season (sorted by receiving yards) alongside both their 2023 and 2024 opportunity and production metrics. We evaluate how Average Route Threat Efficiency ($aRTE$), Maximum Route Threat Efficiency ($mRTE$), and Final Route Threat Efficiency ($fRTE$) capture distinct receiver capabilities, handle depth-versus-separation trade-offs, and predict future downfield threat.
+
+![2023 RTE and Opportunity](~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/Analysis/receiver_RTE_table_2023.png){#fig-rte2023 width=40%}
+
+## 4.1 Co-Linearity and Archetypal Divergence
+
+Across the general population of wide receivers, $mRTE$ and $aRTE$ exhibit strong co-linearity. Receivers who build high peak threat windows typically sustain elevated spatial control across the entire pre-pass window. Consequently, distinguishing receiver archetypes purely through metric divergence presents a structural challenge for most route profiles.
+
+However, systematic divergence emerges among explosive, deep-threat receiver archetypes. Receivers characterized by their ability to be a deep threat, such as George Pickens ($aRTE$ of 54.6 vs. $mRTE$ of 41.2) and DK Metcalf ($aRTE$ of 78.1 vs. $mRTE$ of 59.5), consistently yield an $aRTE$ that outpaces their $mRTE$. Because these receivers leverage their speed to create and maintain control over high-value space downfield on deep go routes, their continuous threat accumulation remains elevated over time.
+
+We also see some archetypal divergence in route runners who generate their production on short and intermediate-area timing routes. These receivers see a higher $mrte$ than $aRTE$ as an artifact of generating high-value space for a short period of time before the pass coverage collapses on their route. Their production relies on accurate pass placement and timing, since these short pass windows are only open for a split-second. Some headliners of this group include Amon-Ra St. Brown (38.5 $mRTE$ vs 32.5 $aRTE$) and Keenan Allen (10.0 $mRTE$ vs 4.3 $aRTE$), both of whom are known for their short-area route running and ability to create separation.
+
+## 4.2 Depth vs. Separation Dynamics
+
+By weighting pitch control through spatial expected points ($xEPA$), the DVS model inherently assigns higher threat values to deeper field locations. To try to avoid over-fitting for pass depth instead of separation, we implemented some $xEPA$ dampeners on the DVS computation ($\sqrt{\vert{}xEPA\vert{}}$). While this addressed some of the over-emphasis, it did not perfectly balance pass depth and separation. A more finely tuned DVS function would be able to address this limitation. Despite this structural emphasis on field depth, final frame efficiency ($fRTE$) successfully differentiates elite separators from contested jump-ball receivers.
+
+As demonstrated in Figure 5, elite short-to-intermediate separators achieve higher $fRTE$ scores than deep contested-catch specialists, even when operating at significantly lower air yards per route (Air YPR). In 2023, Amon-Ra St. Brown posted an $fRTE$ of 43.6 with an Air YPR of 7.1, outpacing deep-ball threat George Pickens ($fRTE$ of 40.2, Air YPR of 11.9). This demonstrates that $fRTE$ does not merely reward downfield depth, but strictly measures a receiver's ability to maximize spatial leverage relative to defender positioning at the instant of the throw. Across all evaluated metrics, $fRTE$ proves to be the most stable indicator of true downfield threat. 
+
+![2023 RTE and 2024 Opportunity](~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/Analysis/receiver_RTE_table_2024.png){#fig-rte2023 width=40%}
+
+## 4.3 Year-Over-Year Stability and Predictive Scope
+
+Evaluating 2023 RTE metrics against 2024 player performance (Figure 6) demonstrates that $fRTE$ serves as a strong predictor of future downfield threat efficiency rather than raw target volume. Because target volume remains bound to team-level play calling, quarterback preference, and offensive line protection, $fRTE$ does not aim to forecast gross target totals. Instead, it predicts a receiver's underlying efficiency profile, such as Air Yards per Reception (YPR), Catch Percentage, and Target Rate, when deployed in a consistent scheme. Barring major schematic changes (e.g. DJ Moore going from CAR to CHI), we see that prior year $fRTE$ generally aligns with the next year's efficiency metrics. 
+
+# 5 NFL Applications
+
+Football front offices and coaching staffs have several avenues for using DVS and RTE in roster construction, team dynamics, and game planning. 
+
+## 5.1 Front Office & Roster Construction
+
+- **Player Evaluation & Valuation**: By isolating continuous spatial control, the DVS framework allows front offices to evaluate players independently of quarterback quality or offensive scheme. It eliminates target bias by rewarding receivers strictly for establishing high-value leverage, helping teams uncover market inefficiencies and accurately project draft prospects without relying on noisy, context-dependent production metrics. 
+
+- **Archetype Profiling**: Teams can pair complementary skill sets by identifying deep field-stretchers who maintain continuous spatial value ($aRTE > mRTE$) versus precision route-runners who win during tight, explosive timing windows ($mRTE > aRTE$).
+
+## 5.2 Coaching Staff & Tactical Game Planning
+
+- **Route Concept Optimization**: Coaches can assess which route concepts maximize spatial threat against specific coverages by evaluating frame-by-frame $DVS$ tracking. This allows offensive coordinators to measure how different route combinations manipulate specific defensive shells. By quantifying these interactions, play-callers can engineer concepts that maximize the total spatial value created across the field. 
+- **Pass Timing**: Coaches can synchronize quarterback dropbacks with a receiver’s exact peak window-creation time, which is measured by their $mRTE$. By pinpointing the specific frame, a receiver establishes maximum spatial leverage, and the coaching staff can tune the quarterback's progression reads to match this timing. This ensures the ball is delivered at the precise moment the downfield threat is most potent.
+- **Defensive Leverage**: Defensive coordinators can invert the framework to identify secondary weaknesses, allowing for targeted bracket coverage against receivers who generate high spatial leverage at the moment of the throw ($fRTE$).
+
+# 6 Discussion & Limitations
+
+## 6.1 Analytical Contributions
+
+This research advances football analytics by synthesizing kinematic pitch control with localized expected drive value ($xEPA$). The DVS framework introduces a non-linear threat transformation that aggressively penalizes contested space, restricts spatial evaluation to physically viable "Reasonable Pass Bounds," and establishes target-independent metrics to accurately project future downfield efficiency.
+
+## 6.2 Limitations & Future Research
+
+- **Depth vs. Separation**: Because deeper routes naturally retain a mathematical advantage, future iterations should incorporate more aggressive adaptive depth normalization to better balance short-area separators against vertical threats.
+- **Multi-Receiver Dynamics**: The current model evaluates isolated WR-DB interactions. Expanding to a multi-agent model would help quantify a receiver's "distraction value" in clearing out coverage for teammates.
+- **3D Kinematics**: Lacking $z$-axis data limits the evaluation of ball height and player elevation. Incorporating vertical tracking will refine time-to-intercept models for high-point and contested catches.
+
+Ultimately, the Dangerous Viable Space framework redefines how wide receiver performance is measured by decoupling individual route-running execution from team-level outcomes. By continuously tracking spatial threat generation rather than relying on static, target-dependent results, the derived RTE metrics provide a more objective and robust foundation for both roster construction and tactical game planning in the modern NFL.
+
+{{< pagebreak >}}
+
+# References
+
+Bischofberger, J., & Baca, A. (2025). Dangerous accessible space: A unified model of space and value in team sports [Preprint]. Research Square. https://doi.org/10.21203/rs.3.rs-6932689/v1
+
+Burke, B. (2010, January 30). Expected points (EP) and expected points added (EPA) explained. Advanced NFL Stats. http://www.advancedfootballanalytics.com/2010/01/expected-points-ep-and-expected-points.html
+
+Carter, V., & Machol, R. E. (1971). Technical note—Operations research on football. Operations Research, 19(2), 541–544. https://doi.org/10.1287/opre.19.2.541
+
+Fernández, J., & Bornn, L. (2018). Wide open spaces: A statistical technique for measuring space creation in professional soccer. Proceedings of the 12th MIT Sloan Sports Analytics Conference.
+
+Inayatali, H., White, A., & Hocevar, D. (2023). Between the lines: How do we measure pressure? [Notebook]. Kaggle, NFL Big Data Bowl 2023. https://www.kaggle.com/code/hassaaninayatali/between-the-lines-how-do-we-measure-pressure
+
+NFL Next Gen Stats. (n.d.). Glossary. National Football League. https://nextgenstats.nfl.com/glossary
+
+Spearman, W. (2018). Beyond expected goals. Proceedings of the 12th MIT Sloan Sports Analytics Conference, 1–17.
+
+Spearman, W., Basye, A., Dick, G., Hotovy, R., & Pop, P. (2017). Physics-based modeling of pass probabilities in soccer. Proceedings of the 11th MIT Sloan Sports Analytics Conference.
+
+Subbaiah, M., Chu, D., Reyers, M., & Wu, L. (2021). Illuminating the defense [Notebook]. Kaggle, NFL Big Data Bowl 2021. https://www.kaggle.com/code/msubbaiah/illuminating-the-defense
+
+Yurko, R., Ventura, S., & Horowitz, M. (2019). nflWAR: A reproducible method for offensive player evaluation in football. Journal of Quantitative Analysis in Sports, 15(3), 163–183. https://doi.org/10.1515/jqas-2018-0010

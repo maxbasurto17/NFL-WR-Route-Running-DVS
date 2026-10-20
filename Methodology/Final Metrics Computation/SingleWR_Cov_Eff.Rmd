@@ -1,0 +1,922 @@
+---
+title: "SingleWR_Cov_Eff"
+output: html_document
+---
+
+# Basic Libraries and Data
+
+```{r}
+
+library(tidyverse)
+library(dplyr)
+library(future)
+library(furrr)
+library(purrr)
+library(mgcv)
+
+# =============================================================================
+# 1. LOAD DATA & ENVELOPE MODEL
+# =============================================================================
+
+full_df <- read_csv("~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/full_data.csv")
+
+# Load exported parameter model from reasonable_pass_bounds_v2
+if (file.exists("optimal_envelope_parameters.rds")) {
+  envelope_model <- readRDS("optimal_envelope_parameters.rds")
+} else {
+  # Fallback default lookup structure if RDS is not present in workspace
+  envelope_model <- list(
+    parameters = tibble(
+      pass_depth_bin   = factor(c("Short", "Medium", "Deep"), levels = c("Short", "Medium", "Deep")),
+      backward_cushion = c(1.0, 1.5, 2.0),
+      corridor_width   = c(2.5, 3.5, 4.5),
+      frames_ahead     = c(10, 15, 20)
+    ),
+    breaks = c(-Inf, 4.5, 12.5, Inf),
+    labels = c("Short", "Medium", "Deep")
+  )
+}
+
+target_receiver_id <- 41233  # Target NFL ID (e.g., Mike Evans)
+
+```
+
+# Model
+
+```{r}
+
+# =============================================================================
+# 2. HELPER FUNCTIONS: GRID SETUP & ENVELOPE COMPUTATION
+# =============================================================================
+
+build_nfl_grid <- function(pitch_length = 120.0, pitch_width = 53.3, n_cols = 120, n_rows = 54) {
+  xs <- seq(0, pitch_length, length.out = n_cols)
+  ys <- seq(0, pitch_width, length.out = n_rows)
+  
+  grid_x <- matrix(rep(xs, each = n_rows), nrow = n_rows, ncol = n_cols)
+  grid_y <- matrix(rep(ys, times = n_cols), nrow = n_rows, ncol = n_cols)
+  
+  return(list(x = grid_x, y = grid_y))
+}
+
+# Vectorized point-to-segment corridor envelope builder
+compute_target_envelope <- function(grid_x, grid_y, wr_x, wr_y, wr_vx, wr_vy, wr_speed, pass_depth, envelope_model) {
+  
+  depth_bin <- cut(pass_depth, breaks = envelope_model$breaks, labels = envelope_model$labels)
+  params <- envelope_model$parameters %>% filter(pass_depth_bin == depth_bin)
+  
+  if (nrow(params) == 0) params <- envelope_model$parameters %>% slice(1)
+  
+  cushion      <- params$backward_cushion[1]
+  corridor_w   <- params$corridor_width[1]
+  frames_ahead <- params$frames_ahead[1]
+  
+  if (wr_speed > 1e-4) {
+    ux <- wr_vx / wr_speed
+    uy <- wr_vy / wr_speed
+  } else {
+    ux <- 0; uy <- 0
+  }
+  
+  # 1 frame = 0.1s in tracking data; proj_len in yards
+  proj_len <- wr_speed * (frames_ahead / 10.0)
+  
+  # Segment endpoints: P0 (backwards cushion) to P1 (forward projection)
+  p0_x <- wr_x - ux * cushion
+  p0_y <- wr_y - uy * cushion
+  p1_x <- wr_x + ux * proj_len
+  p1_y <- wr_y + uy * proj_len
+  
+  seg_dx <- p1_x - p0_x
+  seg_dy <- p1_y - p0_y
+  denom  <- seg_dx^2 + seg_dy^2
+  
+  if (denom > 0) {
+    t <- ((grid_x - p0_x) * seg_dx + (grid_y - p0_y) * seg_dy) / denom
+    t <- pmin(pmax(t, 0), 1)
+  } else {
+    t <- 0
+  }
+  
+  proj_x <- p0_x + t * seg_dx
+  proj_y <- p0_y + t * seg_dy
+  dist   <- sqrt((grid_x - proj_x)^2 + (grid_y - proj_y)^2)
+  
+  return(dist <= corridor_w)
+}
+
+# =============================================================================
+# 3. KINEMATICS & PITCH CONTROL METRICS
+# =============================================================================
+
+player_time_to_intercept <- function(player, target_x, target_y, default_vmax = 11.0, default_accel = 8.0) {
+  vmax <- if (!is.null(player$vmax)) player$vmax else default_vmax
+  acceleration <- if (!is.null(player$acceleration)) player$acceleration else default_accel
+
+  p0 <- c(player$x, player$y)
+  v0_vec <- c(player$vx, player$vy)
+  
+  dx <- target_x - p0[1]
+  dy <- target_y - p0[2]
+  
+  distances <- sqrt(dx^2 + dy^2)
+  distances[distances == 0 | is.na(distances)] <- 1e-8
+  
+  unit_x <- dx / distances
+  unit_y <- dy / distances
+  
+  v0_proj <- v0_vec[1] * unit_x + v0_vec[2] * unit_y
+  v0_proj <- pmin(v0_proj, vmax)
+  
+  t_acc <- (vmax - v0_proj) / acceleration
+  d_acc <- (v0_proj * t_acc) + (0.5 * acceleration * (t_acc^2))
+  
+  tti <- array(0, dim = dim(distances))
+  if (is.null(dim(distances))) tti <- numeric(length(distances))
+  
+  acc_phase_mask <- d_acc >= distances
+  acc_phase_mask[is.na(acc_phase_mask)] <- FALSE 
+  cruise_phase_mask <- !acc_phase_mask
+  cruise_phase_mask[is.na(cruise_phase_mask)] <- FALSE 
+  
+  sqrt_term <- pmax(v0_proj^2 + 2 * acceleration * distances, 0)
+  
+  if (any(acc_phase_mask, na.rm = TRUE)) {
+    tti[acc_phase_mask] <- (-v0_proj[acc_phase_mask] + sqrt(sqrt_term[acc_phase_mask])) / acceleration
+  }
+  if (any(cruise_phase_mask, na.rm = TRUE)) {
+    d_cruise <- distances[cruise_phase_mask] - d_acc[cruise_phase_mask]
+    tti[cruise_phase_mask] <- t_acc[cruise_phase_mask] + (d_cruise / vmax)
+  }
+  return(tti)
+}
+
+estimate_nfl_pass_bounds <- function(distances) {
+  min_time <- distances / 23.0 
+  max_time <- distances / 14.0
+  return(list(min = pmax(min_time, 0.0), max = pmax(max_time, 0.0)))
+}
+
+football_travel_time <- function(qb_x, qb_y, target_x, target_y, attacking_players) {
+  dx <- target_x - qb_x
+  dy <- target_y - qb_y
+  distances <- sqrt(dx^2 + dy^2)
+  
+  bounds <- estimate_nfl_pass_bounds(distances)
+  tti_shape <- dim(target_x)
+  nearest_attacker_tti <- if (is.null(tti_shape)) rep(Inf, length(target_x)) else array(Inf, dim = tti_shape)
+  
+  for (player in attacking_players) {
+    if (abs(player$x - qb_x) < 0.1 && abs(player$y - qb_y) < 0.1) next
+    player_tti <- player_time_to_intercept(player, target_x, target_y)
+    nearest_attacker_tti <- pmin(nearest_attacker_tti, player_tti)
+  }
+  
+  return(pmin(pmax(nearest_attacker_tti, bounds$min), bounds$max))
+}
+
+arrival_probability <- function(t, tti, tti_sigma = 0.54) {
+  exponent <- -pi / sqrt(3.0) / tti_sigma * (t - tti)
+  exponent <- pmin(pmax(exponent, -50), 50)
+  return(1.0 / (1.0 + exp(exponent)))
+}
+
+control_rate <- function(t, tti, lambda_j = 3.99, tti_sigma = 0.54) {
+  return(arrival_probability(t, tti, tti_sigma) * lambda_j)
+}
+
+nfl_dynamic_pitch_control <- function(attacking_players, defending_players, qb_pos, grid_x, grid_y, in_target_zone = NULL,
+                                      dt = 0.05, max_time = 8.0, lambda_att = 3.89, kappa = 1.18, tti_sigma = 0.67) {
+  
+  lambda_def <- lambda_att * kappa
+  TTI_att <- lapply(attacking_players, function(p) player_time_to_intercept(p, grid_x, grid_y))
+  TTI_def <- lapply(defending_players, function(p) player_time_to_intercept(p, grid_x, grid_y))
+  
+  T_ball <- football_travel_time(qb_pos$x, qb_pos$y, grid_x, grid_y, attacking_players)
+  
+  PPCF_att <- array(0.0, dim = dim(grid_x))
+  PPCF_def <- array(0.0, dim = dim(grid_x))
+  PPCF_tot <- array(0.0, dim = dim(grid_x))
+  
+  integration_times <- seq(0.0, max_time, by = dt)
+  
+  for (t in integration_times) {
+    active <- t >= T_ball
+    if (!any(active)) next
+    
+    calc_mask <- active & (PPCF_tot < 0.999)
+    if (!is.null(in_target_zone)) {
+      calc_mask <- calc_mask & in_target_zone
+    }
+    if (!any(calc_mask)) next
+    
+    rate_att_cells <- lapply(TTI_att, function(tti_mat) control_rate(t, tti_mat[calc_mask], lambda_att, tti_sigma))
+    rate_def_cells <- lapply(TTI_def, function(tti_mat) control_rate(t, tti_mat[calc_mask], lambda_def, tti_sigma))
+    
+    rate_att <- Reduce("+", rate_att_cells)
+    rate_def <- Reduce("+", rate_def_cells)
+    
+    uncontrolled_prob <- 1.0 - PPCF_tot[calc_mask]
+    
+    dPPCF_att <- uncontrolled_prob * rate_att * dt
+    dPPCF_def <- uncontrolled_prob * rate_def * dt
+    
+    PPCF_att[calc_mask] <- PPCF_att[calc_mask] + dPPCF_att
+    PPCF_def[calc_mask] <- PPCF_def[calc_mask] + dPPCF_def
+    PPCF_tot[calc_mask] <- PPCF_tot[calc_mask] + dPPCF_att + dPPCF_def
+  }
+  
+  behind_qb_mask <- grid_x < qb_pos$x
+  PPCF_att[behind_qb_mask] <- 0.0
+  
+  return(list(PPCF_att = PPCF_att, PPCF_def = PPCF_def))
+}
+
+```
+
+# Processing
+```{r}
+# =============================================================================
+# 4. DATA PIPELINE & PLAY PROCESSING
+# =============================================================================
+
+# Pre-compute player athletic profiles
+player_profiles <- full_df %>%
+  filter(!is.na(nfl_id), !is.na(s)) %>%
+  group_by(nfl_id) %>%
+  summarize(
+    vmax = pmax(pmin(quantile(s, 0.99, na.rm = TRUE), 12.5), 7.0),
+    acceleration = if ("a" %in% names(.)) pmax(pmin(quantile(a, 0.99, na.rm = TRUE), 10.0), 5.0) else 8.0,
+    .groups = "drop"
+  )
+
+optimized_df <- full_df %>%
+  filter(phase == "pre_pass", !is.na(nfl_id)) %>%
+  group_by(game_id, play_id) %>%
+  filter(any(nfl_id == target_receiver_id)) %>%
+  ungroup() %>%
+  filter(tolower(player_side) == "defense" | nfl_id == target_receiver_id | tolower(player_position) == "qb") %>%
+  left_join(player_profiles, by = "nfl_id") %>%
+  mutate(
+    vmax = coalesce(vmax, 11.0),
+    acceleration = coalesce(acceleration, 8.0)
+  )
+
+plays_list <- optimized_df %>%
+  group_by(game_id, play_id) %>%
+  group_split()
+
+process_single_play <- function(play_data, output_dir, target_wr_id, envelope_model) {
+  
+  current_game_id <- play_data$game_id[1]
+  current_play_id <- play_data$play_id[1]
+  
+  play_processed <- play_data %>%
+    filter(!is.na(nfl_id), phase == "pre_pass") %>%
+    mutate(
+      player_side = tolower(player_side), 
+      dir_rad = dir_std * pi / 180, 
+      vx = s * sin(dir_rad),
+      vy = s * cos(dir_rad)
+    ) %>%
+    filter(!is.na(x_std) & !is.na(y_std) & !is.na(vx) & !is.na(vy))
+  
+  if (nrow(play_processed) == 0) return(NA_character_)
+  
+  frames <- sort(unique(play_processed$frame_id))
+  grids <- build_nfl_grid(n_cols = 120, n_rows = 54)
+  
+  xs <- seq(0, 120.0, length.out = 120)
+  ys <- seq(0, 53.3, length.out = 54)
+  grid_df_base <- expand.grid(y = ys, x = xs) 
+  
+  all_frames_ppcf <- list()
+  
+  for (f in frames) {
+    frame_data <- play_processed %>% filter(frame_id == f)
+    
+    offense_df <- frame_data %>% filter(player_side == "offense")
+    defense_df <- frame_data %>% filter(player_side == "defense")
+    
+    to_player_list <- function(df) {
+      if (nrow(df) == 0) return(list())
+      lapply(1:nrow(df), function(i) {
+        list(
+          id = df$nfl_id[i], x = df$x_std[i], y = df$y_std[i], 
+          vx = df$vx[i], vy = df$vy[i], vmax = df$vmax[i], acceleration = df$acceleration[i]
+        )
+      })
+    }
+    
+    qb_row <- offense_df %>% filter(tolower(player_position) == "qb") %>% slice(1)
+    if (nrow(qb_row) == 0) qb_row <- offense_df %>% slice(1) 
+    
+    qb_pos <- if (nrow(qb_row) > 0) list(x = qb_row$x_std, y = qb_row$y_std) else list(x = 60, y = 26.6)
+    if (nrow(qb_row) > 0) offense_df <- offense_df %>% filter(nfl_id != qb_row$nfl_id)
+    
+    target_offense_df <- offense_df %>% filter(nfl_id == target_wr_id)
+    if (nrow(target_offense_df) == 0) next
+    
+    attacking_players <- to_player_list(target_offense_df)
+    defending_players <- to_player_list(defense_df)
+    
+    if (length(attacking_players) == 0 || length(defending_players) == 0) next
+    
+    wr_x <- target_offense_df$x_std[1]
+    wr_y <- target_offense_df$y_std[1]
+    wr_vx <- target_offense_df$vx[1]
+    wr_vy <- target_offense_df$vy[1]
+    wr_speed <- target_offense_df$s[1]
+    los_x <- target_offense_df$los_x_std[1]
+    pass_depth <- wr_x - los_x
+    
+    # Calculate target zone envelope bounds dynamically
+    in_target_zone <- compute_target_envelope(
+      grid_x = grids$x, grid_y = grids$y,
+      wr_x = wr_x, wr_y = wr_y, wr_vx = wr_vx, wr_vy = wr_vy,
+      wr_speed = wr_speed, pass_depth = pass_depth, envelope_model = envelope_model
+    )
+    
+    results <- tryCatch({
+      nfl_dynamic_pitch_control(
+        attacking_players = attacking_players,
+        defending_players = defending_players,
+        qb_pos = qb_pos,
+        grid_x = grids$x, grid_y = grids$y,
+        in_target_zone = in_target_zone
+      )
+    }, error = function(e) NULL)
+    
+    if (is.null(results)) next
+    
+    frame_surface <- grid_df_base
+    frame_surface$frame_id <- f
+    frame_surface$ppcf_att <- as.vector(results$PPCF_att) 
+    frame_surface$in_target_zone <- as.vector(in_target_zone)
+    
+    all_frames_ppcf[[as.character(f)]] <- frame_surface
+  }
+  
+  if (length(all_frames_ppcf) == 0) return(NA_character_)
+  
+  surface_data <- bind_rows(all_frames_ppcf) %>%
+    mutate(game_id = current_game_id, play_id = current_play_id)
+  
+  file_name <- file.path(output_dir, paste0("play_", current_game_id, "_", current_play_id, ".rds"))
+  saveRDS(surface_data, file_name)
+  return(file_name)
+}
+
+# =============================================================================
+# 5. EXECUTION & PARALLEL WORKERS
+# =============================================================================
+
+temp_dir <- "play_results_temp"
+if (dir.exists(temp_dir)) unlink(temp_dir, recursive = TRUE, force = TRUE)
+dir.create(temp_dir, showWarnings = FALSE, recursive = TRUE)
+
+plan(multisession, workers = 8)
+
+saved_files <- future_map_chr(
+  plays_list, 
+  ~ process_single_play(.x, temp_dir, target_wr_id = target_receiver_id, envelope_model = envelope_model),
+  .options = furrr_options(seed = TRUE),
+  .progress = TRUE
+)
+
+plan(sequential)
+
+valid_saved_files <- saved_files[!is.na(saved_files) & file.exists(saved_files)]
+if (length(valid_saved_files) > 0) {
+  final_surface_data <- bind_rows(lapply(valid_saved_files, readRDS))
+  write.csv(final_surface_data, "Mike_Evans_field_control_data.csv", row.names = FALSE)
+  message("Field control computation successfully completed using dynamic reasonable pass bounds.")
+}
+```
+
+# Plot Field Control
+
+```{r}
+# =============================================================================
+# PLOT
+# =============================================================================
+
+plot_nfl_pitch_control_anim <- function(play_results) {
+  surface_data <- play_results$surface_data
+  
+  player_data <- play_results$player_data %>%
+    mutate(player_side = tolower(player_side)) %>%
+    filter(!is.na(x_std) & !is.na(y_std) & !is.na(vx) & !is.na(vy))
+  
+  ymin <- 0; ymax <- 53.3
+  xmin <- 0; xmax <- 120
+  
+  field_plot <- ggplot() +
+    annotate("rect", xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = "#1e7a3a") +
+    annotate("rect", xmin = 0, xmax = 10, ymin = ymin, ymax = ymax, fill = "#135c29") +
+    annotate("rect", xmin = 110, xmax = 120, ymin = ymin, ymax = ymax, fill = "#135c29") +
+    geom_vline(xintercept = seq(10, 110, by = 5), color = "white", alpha = 0.5) +
+    geom_vline(xintercept = seq(10, 110, by = 10), color = "white", linewidth = 1)
+  
+  animated_plot <- field_plot +
+    geom_tile(
+      data = surface_data, 
+      aes(x = x, y = y, fill = ppcf_att), 
+      alpha = 0.65
+    ) +
+    scale_fill_gradient2(
+      low = "white", mid = "pink", high = "#b91c1c", 
+      midpoint = 0.5, limits = c(0, 1), 
+      name = "Offense\nControl Prob"
+    ) +
+    geom_segment(
+      data = player_data,
+      aes(
+        x = x_std, y = y_std, 
+        xend = x_std + vx * 0.5, yend = y_std + vy * 0.5,
+        color = player_side
+      ),
+      arrow = arrow(length = unit(0.1, "cm")), 
+      linewidth = 0.8 
+    ) +
+    geom_point(
+      data = player_data, 
+      aes(x = x_std, y = y_std), 
+      size = 4, color = "black"
+    ) +
+    geom_point(
+      data = player_data, 
+      aes(x = x_std, y = y_std, color = player_side), 
+      size = 2.8 
+    ) +
+    scale_color_manual(
+      values = c("offense" = "#facc15", "defense" = "#3b82f6"),
+      name = "Team"
+    ) +
+    coord_fixed() +
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      legend.position = "bottom"
+    ) +
+    labs(title = 'Frame: {current_frame}') +
+    transition_manual(frame_id)
+  
+  return(animated_plot)
+}
+
+# 1. Identify first play
+target_game <- final_surface_data$game_id[1]
+target_play <- final_surface_data$play_id[1]
+
+# 2. Filter surface data for this play
+anim_surface_data <- final_surface_data %>%
+  filter(game_id == target_game, play_id == target_play)
+
+# 3. Filter tracking dots to ONLY Mike Evans, QB, and Defense across valid pre_pass frames
+anim_player_data <- full_df %>%
+  filter(
+    game_id == target_game, 
+    play_id == target_play,
+    frame_id %in% unique(anim_surface_data$frame_id),
+    (nfl_id == target_receiver_id | tolower(player_position) == "qb" | tolower(player_side) == "defense")
+  ) %>%
+  mutate(
+    dir_rad = dir_std * pi / 180,
+    vx = s * sin(dir_rad),
+    vy = s * cos(dir_rad)
+  )
+
+# 4. Package and render
+play_results <- list(
+  surface_data = anim_surface_data,
+  player_data = anim_player_data
+)
+
+anim <- plot_nfl_pitch_control_anim(play_results)
+animate(
+  anim, 
+  nframes = length(unique(play_results$surface_data$frame_id)), 
+  fps = 10, 
+  width = 800, 
+  height = 400
+)
+```
+
+# Incorporate Coverage Efficiency
+```{r}
+rm(list = ls(all.names = TRUE))
+gc()
+library(tidyverse)
+library(mgcv)
+library(future)
+library(furrr)
+
+# =============================================================================
+# 1. LOAD DATA & MODELS
+# =============================================================================
+# Raw Tracking Data
+full_df <- read_csv("~/Documents/Football_R/CMSAC--Field Value/full_data.csv")
+
+# Single WR Field Control Data (Multi-Frame)
+field_control <- read_csv("~/Documents/Football_R/CMSAC--Field Value/Mike_Evans_field_control_data.csv")
+
+# GAM Field Value Model
+field_value <- readRDS("~/Documents/Football_R/CMSAC--Field Value/gam_field_value_model.rds")
+```
+
+```{r}
+# =============================================================================
+# 2. PREPARE GRID & PLAY METADATA
+# =============================================================================
+play_data <- full_df %>% 
+  select(game_id, play_id, frame_id, ball_land_y_std, expected_points, los_x_std, dropback_distance) %>% 
+  distinct()
+
+feed_model <- field_control %>% 
+  left_join(play_data, by = c("game_id", "play_id", "frame_id")) %>% 
+  mutate(pass_depth = x - los_x_std) %>% 
+  # Eliminate impossible passes beyond the back of the endzone (120 yards)
+  filter((los_x_std + pass_depth) <= 120)
+
+# =============================================================================
+# 3. CHUNKED MODEL PREDICTIONS
+# =============================================================================
+# Select ONLY the variables required by the GAM model formula
+gam_vars <- intersect(all.vars(formula(field_value)), names(feed_model))
+predict_data <- feed_model %>% select(all_of(gam_vars))
+
+# Split dataset into ordered chunks
+chunk_size <- 500000 
+chunks_list <- split(predict_data, (seq_len(nrow(predict_data)) - 1) %/% chunk_size)
+
+# Run Parallel Predictions
+plan(multisession, workers = 8)
+
+message(sprintf("Running parallel GAM predictions across %d workers...", 8))
+
+predictions <- future_map(
+  chunks_list,
+  ~ predict(field_value, newdata = .x, type = "response", se.fit = FALSE),
+  .options = furrr_options(globals = c("field_value"), seed = TRUE),
+  .progress = TRUE
+)
+
+plan(sequential) # Reset parallel plan
+
+# =============================================================================
+# 4. COMPUTE GRID-LEVEL EFFICIENCY
+# =============================================================================
+feed_model$pred_post_epa <- unlist(predictions)
+feed_model$epa <- feed_model$pred_post_epa - feed_model$expected_points
+
+# Raw non-linear efficiency metric
+raw_eff <- (sign(feed_model$epa) * sqrt(abs(feed_model$epa))) * (feed_model$ppcf_att^2)
+
+# Scale efficiency and zero-out values behind the QB dropback position
+all_grid <- feed_model %>% 
+  mutate(
+    efficiency = as.numeric(raw_eff),
+   efficiency = ifelse((pass_depth + dropback_distance) <= 0, 0, efficiency)
+  )
+
+# =============================================================================
+# 5. AGGREGATE EFFICIENCY ACROSS FRAMES
+# =============================================================================
+
+# (A) Frame-by-Frame Efficiency (Tracks route development over time)
+frame_efficiency <- all_grid %>% 
+  filter(in_target_zone == TRUE) %>% 
+  group_by(game_id, play_id, frame_id) %>% 
+  summarize(
+    total_wr_control = sum(ppcf_att, na.rm = TRUE),
+    mean_wr_control  = mean(ppcf_att, na.rm = TRUE),
+    frame_efficiency = sum(efficiency, na.rm = TRUE),
+    pass_depth       = first(pass_depth),
+    .groups = "drop"
+  )
+
+# (B) Play-Level Summary (Aggregates performance across all pre-pass frames)
+play_efficiency <- frame_efficiency %>% 
+  group_by(game_id, play_id) %>% 
+  summarize(
+    avg_play_efficiency = mean(frame_efficiency, na.rm = TRUE),
+    peak_frame_efficiency = max(frame_efficiency, na.rm = TRUE),
+    final_frame_efficiency = last(frame_efficiency),
+    total_frames_analyzed = n_distinct(frame_id),
+    .groups = "drop"
+  )
+
+# =============================================================================
+# 6. SAVE OUTPUTS
+# =============================================================================
+write_csv(all_grid, "Mike_Evans_grid_coverage_efficiency.csv")
+write_csv(frame_efficiency, "Mike_Evans_frame_coverage_efficiency.csv")
+write_csv(play_efficiency, "Mike_Evans_play_coverage_efficiency.csv")
+
+message("Processing complete! Frame and play efficiency datasets exported.")
+```
+
+```{r}
+rm(list = ls(all.names = TRUE))
+gc()
+# =============================================================================
+# GGANIMATE COVERAGE EFFICIENCY WITH INTERACTIVE HTML FRAME SLIDER
+# =============================================================================
+
+library(tidyverse)
+library(ggplot2)
+library(gganimate)
+library(htmltools)
+library(jsonlite)
+library(base64enc)
+
+# -----------------------------------------------------------------------------
+# 1. LOAD DATA FILES
+# -----------------------------------------------------------------------------
+full_df <- read_csv("~/Documents/Football_R/CMSAC--Field Value/full_data.csv")
+all_grid <- read_csv("Mike_Evans_grid_coverage_efficiency.csv")
+frame_efficiency <- read_csv("Mike_Evans_frame_coverage_efficiency.csv")
+
+target_receiver_id <- 41233  # Mike Evans NFL ID
+```
+
+```{r}
+# -----------------------------------------------------------------------------
+# 2. PREPARE ANIMATION DATA & CUMULATIVE STATS
+# -----------------------------------------------------------------------------
+play_idx <- 11  # Change play index
+
+target_play_info <- all_grid %>% 
+  select(game_id, play_id) %>% 
+  distinct(game_id, play_id) %>% 
+  slice(play_idx)
+
+target_game <- target_play_info$game_id
+target_play <- target_play_info$play_id
+
+# Extract unique play metadata from full_df
+play_meta <- full_df %>%
+  filter(game_id == target_game, play_id == target_play) %>%
+  mutate(
+    # Standardize Line of Scrimmage (LOS)
+    los_x_std = if_else(play_direction == "left", 120 - absolute_yardline_number, absolute_yardline_number),
+    
+    # First Down Line (always offset to the right)
+    first_down_x_std = los_x_std + yards_to_go
+  ) %>% 
+  slice(1)
+
+### ---> NEW: Extract yardline and yards to go for the plot lines[cite: 1] <---
+abs_yardline <- play_meta$los_x_std
+ytg <- play_meta$yards_to_go
+
+play_title_text <- paste0(
+  "Home: ", play_meta$home_team_abbr, 
+  "; Away: ", play_meta$visitor_team_abbr, 
+  "; (", play_meta$quarter, ") ", 
+  play_meta$play_description
+)
+
+# Dynamic frame-by-frame stats
+anim_frame_stats <- frame_efficiency %>%
+  filter(game_id == target_game, play_id == target_play) %>%
+  mutate(frame_id = as.numeric(frame_id)) %>%
+  arrange(frame_id) %>%
+  mutate(
+    running_peak_eff = cummax(frame_efficiency),
+    running_avg_eff  = cummean(frame_efficiency)
+  )
+
+# Merge grid surface with dynamic frame stats
+anim_eff_surface_data <- all_grid %>%
+  filter(game_id == target_game, play_id == target_play) %>%
+  mutate(frame_id = as.numeric(frame_id)) %>%
+  left_join(anim_frame_stats, by = c("game_id", "play_id", "frame_id"))
+
+# Tracking coordinates (Target WR, QB, Defense) with 1.8x vector scaling
+anim_eff_player_data <- full_df %>%
+  filter(
+    game_id == target_game, 
+    play_id == target_play,
+    frame_id %in% unique(anim_eff_surface_data$frame_id),
+    (nfl_id == target_receiver_id | tolower(player_position) == "qb" | tolower(player_side) == "defense")
+  ) %>%
+  mutate(
+    frame_id = as.numeric(frame_id),
+    player_side = tolower(player_side),
+    dir_rad = dir_std * pi / 180,
+    vx = s * sin(dir_rad),
+    vy = s * cos(dir_rad)
+  ) %>%
+  filter(!is.na(x_std) & !is.na(y_std) & !is.na(vx) & !is.na(vy))
+
+# -----------------------------------------------------------------------------
+# 3. BUILD GGANIMATE PLOT OBJECT
+# -----------------------------------------------------------------------------
+### ---> MODIFIED: Added line_of_scrimmage and first_down_marker arguments <---
+plot_nfl_coverage_eff_anim <- function(surface_data, player_data, plot_title, line_of_scrimmage, first_down_marker) {
+  ymin <- 0; ymax <- 53.3
+  xmin <- 0; xmax <- 120
+  
+  field_plot <- ggplot() +
+    # Field Background
+    annotate("rect", xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = "#1e7a3a") +
+    annotate("rect", xmin = 0, xmax = 10, ymin = ymin, ymax = ymax, fill = "#135c29") +
+    annotate("rect", xmin = 110, xmax = 120, ymin = ymin, ymax = ymax, fill = "#135c29") +
+    geom_vline(xintercept = seq(10, 110, by = 5), color = "white", alpha = 0.5) +
+    geom_vline(xintercept = seq(10, 110, by = 10), color = "white", linewidth = 1) +
+    
+    ### Added line of scrimmage (black) and first down marker (yellow)
+    annotate("segment", x = line_of_scrimmage, xend = line_of_scrimmage, y = ymin, yend = ymax, color = "black", linewidth = 1.2) +
+    annotate("segment", x = first_down_marker, xend = first_down_marker, y = ymin, yend = ymax, color = "yellow", linewidth = 1.2) +
+    
+    # Side Dashboard Box (x: 121 to 142)
+    annotate("rect", xmin = 121, xmax = 142, ymin = ymin, ymax = ymax, fill = "#0f172a") +
+    annotate("text", x = 131.5, y = 48, label = "EFFICIENCY METRICS", color = "white", fontface = "bold", size = 4) +
+    annotate("segment", x = 123, xend = 140, y = 45, yend = 45, color = "white", alpha = 0.3)
+  
+  animated_plot <- field_plot +
+    # Coverage Efficiency Heatmap
+    geom_tile(
+      data = surface_data %>% filter(in_target_zone == TRUE), 
+      aes(x = x, y = y, fill = efficiency), 
+      alpha = 0.75
+    ) +
+    ### ---> HIGHLIGHT: Modified to always scale 0-0.75 and shifted midpoint to 0.375
+    scale_fill_gradient2(
+      low = "white", mid = "lightpink", high = "#dc2626", 
+      midpoint = 0.25, limits = c(0, 0.5), name = "Route Threat\nEfficiency"
+    ) +
+    
+    # Dynamic Dashboard Text Labels
+    geom_text(
+      data = surface_data %>% group_by(frame_id) %>% slice(1),
+      aes(
+        x = 131.5, y = 38,
+        label = paste0("Total WR Control:\n", sprintf("%.2f", total_wr_control))
+      ),
+      color = "#38bdf8", fontface = "bold", size = 3.8, hjust = 0.5
+    ) +
+    geom_text(
+      data = surface_data %>% group_by(frame_id) %>% slice(1),
+      aes(
+        x = 131.5, y = 28,
+        label = paste0("Frame Efficiency:\n", sprintf("%.2f", frame_efficiency))
+      ),
+      color = "#facc15", fontface = "bold", size = 3.8, hjust = 0.5
+    ) +
+    geom_text(
+      data = surface_data %>% group_by(frame_id) %>% slice(1),
+      aes(
+        x = 131.5, y = 18,
+        label = paste0("Peak Eff (To Date):\n", sprintf("%.2f", running_peak_eff))
+      ),
+      color = "#4ade80", fontface = "bold", size = 3.8, hjust = 0.5
+    ) +
+    geom_text(
+      data = surface_data %>% group_by(frame_id) %>% slice(1),
+      aes(
+        x = 131.5, y = 8,
+        label = paste0("Avg Eff (To Date):\n", sprintf("%.2f", running_avg_eff))
+      ),
+      color = "#f43f5e", fontface = "bold", size = 3.8, hjust = 0.5
+    ) +
+    
+    # Enlarged Movement Vectors with Arrowheads
+    geom_segment(
+      data = player_data,
+      aes(
+        x = x_std, y = y_std, 
+        xend = x_std + vx * 1.8, yend = y_std + vy * 1.8,
+        color = player_side
+      ),
+      arrow = arrow(length = unit(0.25, "cm")), 
+      linewidth = 1.1 
+    ) +
+    geom_point(
+      data = player_data, 
+      aes(x = x_std, y = y_std), 
+      size = 4.5, color = "black"
+    ) +
+    geom_point(
+      data = player_data, 
+      aes(x = x_std, y = y_std, color = player_side), 
+      size = 3.2 
+    ) +
+    scale_color_manual(
+      values = c("offense" = "#facc15", "defense" = "#3b82f6"),
+      name = "Team"
+    ) +
+    coord_fixed(xlim = c(0, 142), ylim = c(0, 53.3)) +
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      legend.position = "bottom",
+      plot.title = element_text(size = 11, face = "bold")
+    ) +
+    # Updated title using metadata string and frame counter
+    labs(title = paste0(plot_title, " | Frame: {current_frame}")) +
+    transition_manual(frame_id)
+  
+  return(animated_plot)
+}
+
+### ---> MODIFIED: Pass the newly extracted variables to the plotting function <---
+anim_eff <- plot_nfl_coverage_eff_anim(
+  surface_data = anim_eff_surface_data, 
+  player_data = anim_eff_player_data, 
+  plot_title = play_title_text,
+  line_of_scrimmage = abs_yardline,
+  first_down_marker = abs_yardline + ytg
+)
+# -----------------------------------------------------------------------------
+# 4. RENDER FRAMES & BUILD INTERACTIVE HTML SLIDER WIDGET
+# -----------------------------------------------------------------------------
+temp_frame_dir <- file.path(tempdir(), "nfl_eff_frames")
+
+# FIX 1: Wipe leftover frame files from previous play runs
+if (dir.exists(temp_frame_dir)) {
+  unlink(temp_frame_dir, recursive = TRUE)
+}
+dir.create(temp_frame_dir, showWarnings = FALSE)
+
+n_frames <- length(unique(anim_eff_surface_data$frame_id))
+
+animate(
+  anim_eff, 
+  nframes = n_frames, 
+  fps = 10, 
+  width = 1280, 
+  height = 720,
+  device = "png",
+  renderer = file_renderer(dir = temp_frame_dir, prefix = "eff_frame_", overwrite = TRUE)
+)
+
+# Encode frames as Base64 strings for self-contained HTML output
+raw_files <- list.files(temp_frame_dir, pattern = "^eff_frame_.*\\.png$", full.names = TRUE)
+frame_files <- stringr::str_sort(raw_files, numeric = TRUE)
+frame_b64 <- sapply(frame_files, function(f) base64enc::dataURI(file = f, mime = "image/png"))
+unique_frames <- sort(unique(anim_eff_surface_data$frame_id))
+
+# Generate HTML/JS Slider Widget
+slider_widget <- HTML(sprintf('
+<div style="width: 950px; margin: 0 auto; text-align: center; font-family: sans-serif;">
+  <div style="margin-bottom: 8px;">
+    <img id="eff_anim_img" src="%s" style="width: 100%%; max-width: 950px; height: auto; border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.15);" />
+  </div>
+  <div style="display: flex; align-items: center; justify-content: center; gap: 14px; background: #0f172a; padding: 10px 18px; border-radius: 8px; color: white;">
+    <button onclick="toggleEffPlay()" id="effPlayBtn" style="padding: 6px 16px; background: #3b82f6; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">Play</button>
+    <span style="font-weight: bold; font-size: 14px;">Frame ID: <span id="eff_frame_val">%d</span></span>
+    <input type="range" id="effFrameSlider" min="0" max="%d" value="0" step="1" oninput="updateEffFrame(this.value)" style="width: 60%%; cursor: pointer;" />
+  </div>
+</div>
+
+<script>
+  var effFrames = %s;
+  var effFrameIds = %s;
+  var effPlaying = false;
+  var effTimer = null;
+
+  function updateEffFrame(val) {
+    var idx = parseInt(val);
+    document.getElementById("eff_anim_img").src = effFrames[idx];
+    document.getElementById("eff_frame_val").innerText = effFrameIds[idx];
+  }
+
+  function toggleEffPlay() {
+    var btn = document.getElementById("effPlayBtn");
+    var slider = document.getElementById("effFrameSlider");
+    if (effPlaying) {
+      clearInterval(effTimer);
+      effPlaying = false;
+      btn.innerText = "Play";
+    } else {
+      effPlaying = true;
+      btn.innerText = "Pause";
+      effTimer = setInterval(function() {
+        var curr = parseInt(slider.value);
+        var next = (curr + 1) %% effFrames.length;
+        slider.value = next;
+        updateEffFrame(next);
+      }, 100);
+    }
+  }
+</script>
+', 
+frame_b64[1], 
+unique_frames[1], 
+length(frame_b64) - 1, 
+jsonlite::toJSON(unname(frame_b64)), 
+jsonlite::toJSON(unname(unique_frames))
+))
+
+# Output HTML Slider Widget directly in R Markdown HTML
+slider_widget
+# Save output as html file
+writeLines(as.character(slider_widget), "Mike_Evans_TD.html")
+```

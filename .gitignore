@@ -6,3 +6,4 @@
 .quarto
 
 full_data.csv
+*.csv

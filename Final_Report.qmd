@@ -206,7 +206,7 @@ As shown in Figure 5, Nico Collins leads all qualifying wide receivers on short 
 
 Short-area specialists like Davante Adams (59.0 $mRTE$, 40 targets, 27.4% target share) and Keenan Allen (51.5 $mRTE$, 29 targets, 22.5% target share) absorb heavy target volume on short concepts. However, high-volume route runners exhibit lower sustained efficiency ($aRTE$) relative to peak window threat ($mRTE$), as shown by DeVonta Smith (54.0 $mRTE$ vs. 44.3 $aRTE$) and Keenan Allen (51.5 $mRTE$ vs. 45.2 $aRTE$). This divergence highlights that short-area route running relies on sharp peak windows where quarterbacks must deliver the ball immediately before defender proximity erodes controlled space.
 
-## 4.2 Medium Route Analysis ($5 - 15$ Yards)
+## 4.2 Medium Route Analysis ($5 - 12$ Yards)
 
 Intermediate routes represent the primary timing window in modern passing schemes. Unlike short routes that rely on immediate release wins, medium routes require receivers to navigate linebacker drop-backs and secondary leverage while maintaining high spatial control through intermediate breaks.
 
@@ -216,7 +216,7 @@ Figure 6 details intermediate route performance. Chris Olave tops the medium dep
 
 A.J. Brown captures the highest intermediate target volume in the sample (55 targets, representing 40.4% of his team's targets) while maintaining a top-tier 59.5 $mRTE$, 56.9 $aRTE$, and an 83.6% completion rate. Amon-Ra St. Brown demonstrates extreme scheme centrality on medium depth concepts, accounting for 50.7% of his target distribution (69 targets) with a 49.8 $mRTE$, 53.1 $aRTE$, and an 81.2% completion rate. The tight alignment between $mRTE$ and $aRTE$ across medium-depth leaders indicates that successful intermediate route running demands both peak window creation at the route break and steady spatial control along the stem.
 
-## 4.3 Long Route Analysis ($15 - 25$ Yards)
+## 4.3 Long Route Analysis ($12 - 20$ Yards)
 
 Long routes operate in open field space where dynamic acceleration, velocity vectors, and boundary leverage dominate. At this depth, spatial $xEPA$ values increase significantly, rewarding receivers who maintain leverage relative to chasing defensive backs.
 
@@ -228,7 +228,7 @@ The long-depth tier reveals two distinct receiver profiles:
 - **Continuous Deep Stretchers ($aRTE > mRTE$)**: Receivers like DJ Moore (55.6 $mRTE$ vs. 64.7 $aRTE$), Mike Evans (59.4 $mRTE$ vs. 66.6 $aRTE$), and DK Metcalf (59.2 $mRTE$ vs. 63.3 $aRTE$) sustain continuous spatial control downfield by using top-end speed to stay ahead of defensive tracking trajectories.
 - **Timing/Break Separators ($mRTE > aRTE$)**: Receivers like DeVonta Smith (68.0 $mRTE$ vs. 56.8 $aRTE$), Brandon Aiyuk (62.5 $mRTE$ vs. 57.4 $aRTE$), and Amon-Ra St. Brown (54.6 $mRTE$ vs. 47.4 $aRTE$) generate sharp peak threat windows at route breaks before defensive pursuit closes the gap.
 
-## 4.4 Ultra-Long Route Analysis ($> 25$ Yards)
+## 4.4 Ultra-Long Route Analysis ($> 20$ Yards)
 
 Ultra-long routes evaluate pure vertical boundary threats. Because ball time-in-air is maximized on ultra-long passes, defensive backs have ample time to recover, making sustained spatial control ($aRTE$) and peak separation ($mRTE$) critical to downfield success.
 

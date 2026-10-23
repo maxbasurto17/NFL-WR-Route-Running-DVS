@@ -190,31 +190,61 @@ From this continuous array of frame-level threat generation, the model extracts 
 
 Figure 4 illustrates this framework in action during a 28-yard touchdown pass to Mike Evans. At the exact frame of pass release, corresponding to the Final Route Threat Efficiency (fRTE) metric, Evans' route leverage and speed vector (yellow dot and arrow) establish a dominant, high-efficiency corridor (shaded red) extending well past the line of scrimmage (black line) and the line to gain (yellow line). Notably, the actual ball landing spot (indicated by the "X") falls directly within the highest concentration of threat efficiency, demonstrating how Evans effectively cleared defensive leverage to create valuable targetable space.
 
-# 4 Metric Validation
 
-To evaluate the empirical validity and practical utility of our Route Threat Efficiency metrics, we analyze continuous tracking data across the top 20 wide receivers from the 2023 NFL season (sorted by receiving yards) alongside both their 2023 and 2024 opportunity and production metrics. We evaluate how Average Route Threat Efficiency ($aRTE$), Maximum Route Threat Efficiency ($mRTE$), and Final Route Threat Efficiency ($fRTE$) capture distinct receiver capabilities, handle depth-versus-separation trade-offs, and predict future downfield threat.
 
-![2023 RTE and Opportunity](~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/Analysis/receiver_RTE_table_2023.png){#fig-rte2023 width=40%}
+# 4 Analysis & Empirical Results
 
-## 4.1 Co-Linearity and Archetypal Divergence
+To evaluate the utility of the Dangerous Viable Space framework, we analyze pre-pass tracking data across the top 20 NFL wide receivers from the 2023 season. Route threat performance is evaluated across route depth tiers—Short, Medium, Long, and Ultra-Long. We examine how Maximum Route Threat Efficiency ($mRTE$) and Average Route Threat Efficiency ($aRTE$) capture route-running efficiency, distinguish receiver archetypes, and validate against traditional outcome metrics like target share, completion percentage ($\text{Comp \%}$), and Air Receiving Yards per Target ($\text{Air Rec Yds / Tgt}$).
 
-Across the general population of wide receivers, $mRTE$ and $aRTE$ exhibit strong co-linearity. Receivers who build high peak threat windows typically sustain elevated spatial control across the entire pre-pass window. Consequently, distinguishing receiver archetypes purely through metric divergence presents a structural challenge for most route profiles.
+## 4.1 Short Route Analysis ($< 5$ Yards)
 
-However, systematic divergence emerges among explosive, deep-threat receiver archetypes. Receivers characterized by their ability to be a deep threat, such as George Pickens ($aRTE$ of 54.6 vs. $mRTE$ of 41.2) and DK Metcalf ($aRTE$ of 78.1 vs. $mRTE$ of 59.5), consistently yield an $aRTE$ that outpaces their $mRTE$. Because these receivers leverage their speed to create and maintain control over high-value space downfield on deep go routes, their continuous threat accumulation remains elevated over time.
+On short-depth routes, threat generation is dictated by immediate spatial separation and route leverage rather than linear speed. Because short routes develop rapidly in congested areas near the line of scrimmage, receivers who win quickly create immediate passing windows before defensive secondary coverage can collapse.
 
-We also see some archetypal divergence in route runners who generate their production on short and intermediate-area timing routes. These receivers see a higher $mrte$ than $aRTE$ as an artifact of generating high-value space for a short period of time before the pass coverage collapses on their route. Their production relies on accurate pass placement and timing, since these short pass windows are only open for a split-second. Some headliners of this group include Amon-Ra St. Brown (38.5 $mRTE$ vs 32.5 $aRTE$) and Keenan Allen (10.0 $mRTE$ vs 4.3 $aRTE$), both of whom are known for their short-area route running and ability to create separation.
+![Top 10 receivers by mRTE on short-depth routes during the 2023 regular season.](~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/Analysis/top10_mRTE_Short_2023.png){#fig-rte-short width=85% fig-align="center"}
 
-## 4.2 Depth vs. Separation Dynamics
+As shown in Figure 5, Nico Collins leads all qualifying wide receivers on short routes with an $mRTE$ percentile of 68.6 and an $aRTE$ percentile of 71.7. Collins's elevated $aRTE$ relative to his $mRTE$ reflects an ability to maintain persistent spatial control throughout the entirety of a short route development. Originally known as a deep threat, Collins has evolved into a versatile receiver who can create significant threat on short routes by leveraging his route running skills. Similarly, A.J. Brown (63.9 $mRTE$, 66.8 $aRTE$), also known as a deep threat and elite contested catch threat, is shown to have high value in short areas too.
 
-By weighting pitch control through spatial expected points ($xEPA$), the DVS model inherently assigns higher threat values to deeper field locations. To try to avoid over-fitting for pass depth instead of separation, we implemented some $xEPA$ dampeners on the DVS computation ($\sqrt{\vert{}xEPA\vert{}}$). While this addressed some of the over-emphasis, it did not perfectly balance pass depth and separation. A more finely tuned DVS function would be able to address this limitation. Despite this structural emphasis on field depth, final frame efficiency ($fRTE$) successfully differentiates elite separators from contested jump-ball receivers.
+Short-area specialists like Davante Adams (59.0 $mRTE$, 40 targets, 27.4% target share) and Keenan Allen (51.5 $mRTE$, 29 targets, 22.5% target share) absorb heavy target volume on short concepts. However, high-volume route runners exhibit lower sustained efficiency ($aRTE$) relative to peak window threat ($mRTE$), as shown by DeVonta Smith (54.0 $mRTE$ vs. 44.3 $aRTE$) and Keenan Allen (51.5 $mRTE$ vs. 45.2 $aRTE$). This divergence highlights that short-area route running relies on sharp peak windows where quarterbacks must deliver the ball immediately before defender proximity erodes controlled space.
 
-As demonstrated in Figure 5, elite short-to-intermediate separators achieve higher $fRTE$ scores than deep contested-catch specialists, even when operating at significantly lower air yards per route (Air YPR). In 2023, Amon-Ra St. Brown posted an $fRTE$ of 43.6 with an Air YPR of 7.1, outpacing deep-ball threat George Pickens ($fRTE$ of 40.2, Air YPR of 11.9). This demonstrates that $fRTE$ does not merely reward downfield depth, but strictly measures a receiver's ability to maximize spatial leverage relative to defender positioning at the instant of the throw. Across all evaluated metrics, $fRTE$ proves to be the most stable indicator of true downfield threat. 
+## 4.2 Medium Route Analysis ($5 - 15$ Yards)
 
-![2023 RTE and 2024 Opportunity](~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/Analysis/receiver_RTE_table_2024.png){#fig-rte2023 width=40%}
+Intermediate routes represent the primary timing window in modern passing schemes. Unlike short routes that rely on immediate release wins, medium routes require receivers to navigate linebacker drop-backs and secondary leverage while maintaining high spatial control through intermediate breaks.
 
-## 4.3 Year-Over-Year Stability and Predictive Scope
+![Top 10 receivers by mRTE on medium-depth routes during the 2023 regular season.](~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/Analysis/top10_mRTE_Medium_2023.png){#fig-rte-medium width=85% fig-align="center"}
 
-Evaluating 2023 RTE metrics against 2024 player performance (Figure 6) demonstrates that $fRTE$ serves as a strong predictor of future downfield threat efficiency rather than raw target volume. Because target volume remains bound to team-level play calling, quarterback preference, and offensive line protection, $fRTE$ does not aim to forecast gross target totals. Instead, it predicts a receiver's underlying efficiency profile, such as Air Yards per Reception (YPR), Catch Percentage, and Target Rate, when deployed in a consistent scheme. Barring major schematic changes (e.g. DJ Moore going from CAR to CHI), we see that prior year $fRTE$ generally aligns with the next year's efficiency metrics. 
+Figure 6 details intermediate route performance. Chris Olave tops the medium depth category with an $mRTE$ of 60.9 and an $aRTE$ of 58.4 across 32 targets (26.2% target share). DK Metcalf ranks second with a 60.3 $mRTE$ and an elevated $aRTE$ of 64.4 (37.9% target share, 61.1% completion rate), demonstrating his capacity to sustain physical spatial dominance along intermediate route stems.
+
+A.J. Brown captures the highest intermediate target volume in the sample (55 targets, representing 40.4% of his team's targets) while maintaining a top-tier 59.5 $mRTE$, 56.9 $aRTE$, and an 83.6% completion rate. Amon-Ra St. Brown demonstrates extreme scheme centrality on medium depth concepts, accounting for 50.7% of his target distribution (69 targets) with a 49.8 $mRTE$, 53.1 $aRTE$, and an 81.2% completion rate. The tight alignment between $mRTE$ and $aRTE$ across medium-depth leaders indicates that successful intermediate route running demands both peak window creation at the route break and steady spatial control along the stem.
+
+## 4.3 Long Route Analysis ($15 - 25$ Yards)
+
+Long routes operate in open field space where dynamic acceleration, velocity vectors, and boundary leverage dominate. At this depth, spatial $xEPA$ values increase significantly, rewarding receivers who maintain leverage relative to chasing defensive backs.
+
+![Top 10 receivers by mRTE on long-depth routes during the 2023 regular season.](~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/Analysis/top10_mRTE_Long_2023.png){#fig-rte-long width=85% fig-align="center"}
+
+As illustrated in Figure 7, DeVonta Smith (68.0 $mRTE$, 56.8 $aRTE$) and Nico Collins (67.9 $mRTE$, 69.7 $aRTE$) lead all receivers on long routes. Collins's continuous spatial dominance is highlighted by an Air Receiving Yards per Target of 10.7 yards and a 65.2% completion rate across 23 targets. Brandon Aiyuk ranks third with a 62.5 $mRTE$ and 57.4 $aRTE$, commanding a massive 41.4% share of his targets while generating 10.5 Air Receiving Yards per Target.
+
+The long-depth tier reveals two distinct receiver profiles:
+- **Continuous Deep Stretchers ($aRTE > mRTE$)**: Receivers like DJ Moore (55.6 $mRTE$ vs. 64.7 $aRTE$), Mike Evans (59.4 $mRTE$ vs. 66.6 $aRTE$), and DK Metcalf (59.2 $mRTE$ vs. 63.3 $aRTE$) sustain continuous spatial control downfield by using top-end speed to stay ahead of defensive tracking trajectories.
+- **Timing/Break Separators ($mRTE > aRTE$)**: Receivers like DeVonta Smith (68.0 $mRTE$ vs. 56.8 $aRTE$), Brandon Aiyuk (62.5 $mRTE$ vs. 57.4 $aRTE$), and Amon-Ra St. Brown (54.6 $mRTE$ vs. 47.4 $aRTE$) generate sharp peak threat windows at route breaks before defensive pursuit closes the gap.
+
+## 4.4 Ultra-Long Route Analysis ($> 25$ Yards)
+
+Ultra-long routes evaluate pure vertical boundary threats. Because ball time-in-air is maximized on ultra-long passes, defensive backs have ample time to recover, making sustained spatial control ($aRTE$) and peak separation ($mRTE$) critical to downfield success.
+
+![Top 10 receivers by mRTE on ultra-long routes during the 2023 regular season.](~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/Analysis/top10_mRTE_Ultra-Long_2023.png){#fig-rte-ultralong width=85% fig-align="center"}
+
+Figure 8 presents the ultra-long route evaluation. DeVonta Smith establishes peak performance across the ultra-long category with a 73.3 $mRTE$ and 74.7 $aRTE$ across 20 targets, generating 14.6 Air Receiving Yards per Target. Nico Collins demonstrates exceptional efficiency on deep shots, recording a 71.2 $mRTE$, 64.6 $aRTE$, a 78.6% completion rate, and an extraordinary 22.1 Air Receiving Yards per Target on 14 targets.
+
+Chris Godwin Jr. (65.8 $mRTE$, 53.8 $aRTE$) and Chris Olave (64.7 $mRTE$, 56.5 $aRTE$) post high peak threat percentiles on ultra-long routes despite lower completion rates (25.0% and 28.0%, respectively). This stark disconnect illustrates a primary advantage of the target-independent DVS framework: while downstream completion percentages on ultra-long passes are heavily contaminated by quarterback throw accuracy, uncatchable passes, and defensive interference, $mRTE$ successfully isolates and credits the receiver's independent ability to create explosive spatial value downfield.
+
+## 4.5 Synthesis & Archetypal Metric Divergence
+
+Synthesizing results across all four depth tiers confirms that $mRTE$ and $aRTE$ provide complementary dimensions of wide receiver route running:
+
+1. **Depth Scaling**: Peak $mRTE$ and continuous $aRTE$ values scale non-linearly with route depth due to the higher intrinsic spatial $xEPA$ of deep field locations and the increased pass bounds available to receivers on longer routes.
+2. **Archetype Identification**: Tracking the delta ($\Delta = mRTE - aRTE$) separates vertical deep-threats who accumulate steady spatial threat along linear paths from precision route runners who generate sharp, transient separation windows at the break point. Where the latter group is identified by a positive $\Delta$, the former group is characterized by a negative $\Delta$.
+3. **Outcome Decoupling**: By measuring spatial control prior to pass arrival, the RTE framework isolates wide receiver quality from quarterback execution, providing a noise-reduced metric for player evaluation and scheme alignment.
 
 # 5 NFL Applications
 

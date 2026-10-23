@@ -7,6 +7,7 @@ output: html_document
 library(tidyverse, ggplot2)
 library(nflfastR)
 library(fuzzyjoin)
+library(gt)
 
 all_plays <- read.csv("~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency/top20_pbp_efficiency.csv")
 ```
@@ -42,16 +43,33 @@ head(receiving_leaderboard)
 ```
 
 ```{r}
+# aDOT: average route depth on plays where the player was the targeted receiver
+adot_df <- all_plays %>%
+  filter(player_role == "Targeted Receiver") %>%
+  group_by(nfl_id) %>%
+  summarize(aDOT = mean(route_depth, na.rm = TRUE), .groups = "drop")
+
 t20_season_RTE_2023 <- all_plays %>% 
-  group_by(player_name, nfl_id) %>% 
+  group_by(player_name, nfl_id, route_group) %>% 
   summarize(
-    mRTE = mean(peak_frame_efficiency),
-    aRTE = mean(avg_play_efficiency),
-    avg_final_eff = mean(final_frame_efficiency),
-    routes_run = n()
+    mRTE = median(peak_frame_efficiency),
+    aRTE = median(avg_play_efficiency),
+    avg_final_eff = median(final_frame_efficiency),
+    routes_run = n(),
+    .groups = "drop"
   ) %>% 
-  arrange(desc(avg_final_eff)) %>% 
-  ungroup() %>% 
+  # one row per player, one column per route_group x metric
+  pivot_wider(
+    id_cols = c(player_name, nfl_id),
+    names_from = route_group,
+    values_from = c(mRTE, aRTE, avg_final_eff, routes_run),
+    names_glue = "{route_group}_{.value}"
+  ) %>% 
+  # total routes across all groups, for target_rate later
+  mutate(
+    total_routes = rowSums(across(ends_with("_routes_run")), na.rm = FALSE)
+  ) %>% 
+  left_join(adot_df, by = "nfl_id") %>%
   mutate(player_abbr = case_when(
       player_name == "Amari Cooper" ~ "A.Cooper",
       player_name == "Brandon Aiyuk" ~ "B.Aiyuk",
@@ -60,25 +78,25 @@ t20_season_RTE_2023 <- all_plays %>%
       player_name == "Mike Evans" ~ "M.Evans",
       player_name == "DK Metcalf" ~ "D.Metcalf",
       player_name == "Tyreek Hill" ~ "T.Hill",
-      player_name == "Devonta Smith" ~ "D.Smith",
+      player_name == "DeVonta Smith" ~ "D.Smith",
       player_name == "Nico Collins" ~ "N.Collins",
-      player_name == "AJ Brown" ~ "A.Brown",
+      player_name == "A.J. Brown" ~ "A.Brown",
       player_name == "Chris Olave" ~ "C.Olave",
       player_name == "DJ Moore" ~ "D.Moore",
       player_name == "Puka Nacua" ~ "P.Nacua",
       player_name == "CeeDee Lamb" ~ "C.Lamb",
-      player_name == "Davantae Adams" ~ "D.Adams",
+      player_name == "Davante Adams" ~ "D.Adams",
       player_name == "Keenan Allen" ~ "K.Allen",
       player_name == "Stefon Diggs" ~ "S.Diggs",
-      player_name == "Amon-Ra St Brown" ~ "A.St. Brown",
-      player_name == "Jamarr Chase" ~ "J.Chase",
+      player_name == "Amon-Ra St. Brown" ~ "A.St. Brown",
+      player_name == "Ja'Marr Chase" ~ "J.Chase",
       player_name == "Michael Pittman" ~ "M.Pittman",
       TRUE ~ player_name
     )
   ) %>% 
   left_join(receiving_leaderboard, by = c("player_abbr" = "player_name")) %>%
   filter(!is.na(air_ypr)) %>% 
-  mutate(target_rate = targets/routes_run)
+  mutate(target_rate = targets / total_routes)
 ```
 
 VIZUAL: mRTE and aRTE are effective in measuring a combination of downfield threat and space creation. 
@@ -87,66 +105,67 @@ VIZUAL: mRTE and aRTE are effective in measuring a combination of downfield thre
 library(gt)
 library(dplyr)
 
-# 1. Define 2023 Min/Max scaling bounds
-mRTE_min <- min(t20_season_RTE_2023$mRTE, na.rm = TRUE)
-mRTE_max <- max(t20_season_RTE_2023$mRTE, na.rm = TRUE)
+route_groups <- c("Short", "Medium", "Long", "Ultra-Long")
 
-aRTE_min <- min(t20_season_RTE_2023$aRTE, na.rm = TRUE)
-aRTE_max <- max(t20_season_RTE_2023$aRTE, na.rm = TRUE)
+# 1. Percentile functions built from play-level max-frame efficiency,
+#    one per route group (so a Short route is compared against other Short routes)
+mRTE_ecdfs <- all_plays %>%
+  split(.$route_group) %>%
+  map(~ ecdf(.x$peak_frame_efficiency))
 
-eff_min  <- min(t20_season_RTE_2023$avg_final_eff, na.rm = TRUE)
-eff_max  <- max(t20_season_RTE_2023$avg_final_eff, na.rm = TRUE)
+# 2. Convert each receiver's per-group mean to a percentile (0-100)
+gt_prep <- t20_season_RTE_2023
+for (g in route_groups) {
+  col <- paste0(g, "_mRTE")
+  gt_prep[[col]] <- mRTE_ecdfs[[g]](gt_prep[[col]]) * 100
+}
 
-# 2. Prepare 2023 data using the 2023 bounds
-gt_prep <- t20_season_RTE_2023 %>%
-  mutate(
-    mRTE_scaled          = (mRTE - mRTE_min) / (mRTE_max - mRTE_min) * 99,
-    aRTE_scaled          = (aRTE - aRTE_min) / (aRTE_max - aRTE_min) * 99,
-    avg_final_eff_scaled = (avg_final_eff - eff_min) / (eff_max - eff_min) * 99
-  ) %>%
+gt_prep <- gt_prep %>%
   select(
-    player_name,
-    recent_team,
-    mRTE = mRTE_scaled,
-    aRTE = aRTE_scaled,
-    avg_final_eff = avg_final_eff_scaled,
-    targets,
-    air_yds,
-    air_ypr,
-    comp_pct,
-    target_rate
+    player_name, recent_team,
+    Short = Short_mRTE,
+    Medium = Medium_mRTE,
+    Long = Long_mRTE,
+    `Ultra-Long` = `Ultra-Long_mRTE`,
+    air_yds, total_routes, targets, target_rate, comp_pct, aDOT
   )
 
-# 3. Construct 2023 GT Table
+# 3. Construct 2023 GT table
 gt_table <- gt_prep %>%
+  arrange(desc(air_yds)) %>%
   gt() %>%
   tab_header(
-    title = md("**2023 Wide Receiver RTE & Opportunity Metrics**"),
-    subtitle = md("mRTE and aRTE relative scale (0–99) | Top 20 WRs by Rec Yards")
+    title = md("**2023 Wide Receiver mRTE by Route Depth & Opportunity Metrics**"),
+    subtitle = md("mRTE: On his average route of this depth, this WR is more dangerous than X% of all Top-20 WR routes of the same depth")
+  ) %>%
+  tab_spanner(
+    label = "mRTE Percentile by Route Group",
+    columns = all_of(route_groups)
   ) %>%
   cols_label(
     player_name = "Player",
     recent_team = "Team",
-    mRTE = "mRTE",
-    aRTE = "aRTE",
-    avg_final_eff = "fRTE",
+    air_yds = "Air Rec Yards",
+    total_routes = "Routes Run",
     targets = "Targets",
-    air_yds = "Air Yards",
-    air_ypr = "Air YPR",
-    comp_pct = "Catch %",
-    target_rate = "Target Rate"
+    target_rate = "Target Rate",
+    comp_pct = "Comp %",
+    aDOT = "aDOT"
   ) %>%
   fmt_percent(columns = c(comp_pct, target_rate), decimals = 1) %>%
-  fmt_number(columns = c(mRTE, aRTE, avg_final_eff, air_ypr), decimals = 1) %>%
-  fmt_number(columns = c(targets, air_yds), decimals = 0) %>%
+  fmt_number(columns = c(all_of(route_groups), aDOT), decimals = 1) %>%
+  fmt_number(columns = c(targets, air_yds, total_routes), decimals = 0) %>%
+  sub_missing(columns = all_of(route_groups), missing_text = "—") %>%
   data_color(
-    columns = c(mRTE, aRTE, avg_final_eff),
-    palette = c("#D73027", "#FFFFBF", "#1A9850")
+    columns = all_of(route_groups),
+    palette = c("#D73027", "#FFFFBF", "#1A9850"),
+    domain = c(0, 100),
+    na_color = "#EEEEEE"
   ) %>%
   cols_align(align = "left", columns = c(player_name, recent_team)) %>%
   cols_align(
     align = "center",
-    columns = c(mRTE, aRTE, avg_final_eff, targets, air_yds, air_ypr, comp_pct, target_rate)
+    columns = c(all_of(route_groups), targets, air_yds, comp_pct, target_rate, total_routes, aDOT)
   ) %>%
   opt_row_striping() %>%
   tab_options(
@@ -158,6 +177,102 @@ gt_table <- gt_prep %>%
 gtsave(gt_table, filename = "receiver_RTE_table_2023.png")
 gt_table
 ```
+
+Compare against targets-only RTE
+```{r}
+route_groups <- c("Short", "Medium", "Long", "Ultra-Long")
+tgt_cols     <- paste0(route_groups, "_tgt")
+
+# 1. Percentile functions (unchanged)
+mRTE_ecdfs <- all_plays %>%
+  # filter(player_role == "Targeted Receiver") %>% 
+  split(.$route_group) %>%
+  map(~ ecdf(.x$peak_frame_efficiency))
+
+# 2. Convert each receiver's per-group median to a percentile (0-100)
+gt_prep <- t20_targets_RTE_2023
+for (g in route_groups) {
+  col <- paste0(g, "_mRTE")
+  gt_prep[[col]] <- mRTE_ecdfs[[g]](gt_prep[[col]]) * 100
+}
+
+gt_prep <- gt_prep %>%
+  arrange(desc(air_yds)) %>%
+  select(
+    player_name, recent_team,
+    Short = Short_mRTE,
+    Medium = Medium_mRTE,
+    Long = Long_mRTE,
+    `Ultra-Long` = `Ultra-Long_mRTE`,
+    Short_tgt = Short_routes_run,
+    Medium_tgt = Medium_routes_run,
+    Long_tgt = Long_routes_run,
+    `Ultra-Long_tgt` = `Ultra-Long_routes_run`
+  ) %>%
+  # no targets in a group = 0, not missing
+  mutate(across(all_of(tgt_cols), ~ coalesce(.x, 0))) %>%
+  # convert counts to share of the receiver's total targets
+  mutate(
+    total_tgt = rowSums(across(all_of(tgt_cols))),
+    across(all_of(tgt_cols), ~ if_else(total_tgt > 0, .x / total_tgt, 0))
+  ) %>%
+  select(-total_tgt)
+
+# 3. Construct 2023 GT table
+gt_table <- gt_prep %>%
+  gt() %>%
+  tab_header(
+    title = md("**2023 Wide Receiver mRTE by Target Depth & Target Distribution**"),
+    subtitle = md("Targets Only | mRTE: On his average target of this depth, this WR is more dangerous than X% of all Top-20 WR routes of the same depth")
+  ) %>%
+  tab_spanner(
+    label = "mRTE Percentile by Target Depth",
+    columns = all_of(route_groups)
+  ) %>%
+  tab_spanner(
+    label = "% of Targets by Depth",
+    columns = all_of(tgt_cols)
+  ) %>%
+  cols_label(
+    player_name = "Player",
+    recent_team = "Team",
+    Short_tgt = "Short",
+    Medium_tgt = "Medium",
+    Long_tgt = "Long",
+    `Ultra-Long_tgt` = "Ultra-Long"
+  ) %>%
+  fmt_number(columns = all_of(route_groups), decimals = 1) %>%
+  fmt_percent(columns = all_of(tgt_cols), decimals = 1) %>%
+  sub_missing(columns = all_of(route_groups), missing_text = "—") %>%
+  data_color(
+    columns = all_of(route_groups),
+    palette = c("#D73027", "#FFFFBF", "#1A9850"),
+    domain = c(0, 100),
+    na_color = "#EEEEEE"
+  ) %>%
+  cols_align(align = "left", columns = c(player_name, recent_team)) %>%
+  cols_align(
+    align = "center",
+    columns = c(all_of(route_groups), all_of(tgt_cols))
+  ) %>%
+  tab_style(
+    style = cell_borders(sides = "left", color = "#999999", weight = px(2)),
+    locations = cells_body(columns = Short_tgt)
+  ) %>%
+  opt_row_striping() %>%
+  tab_options(
+    table.font.size = px(13),
+    heading.title.font.size = px(16),
+    column_labels.font.weight = "bold"
+  )
+
+gtsave(gt_table, filename = "receiver__targets_RTE_table_2023.png")
+gt_table
+```
+
+
+
+
 
 Use 2023 RTE to predict 2024 Stats
 ```{r}
@@ -291,4 +406,167 @@ gt_table_2024 <- gt_prep_2024 %>%
 
 gtsave(gt_table_2024, filename = "receiver_RTE_table_2024.png")
 gt_table_2024
+```
+
+```{r}
+rte_vars <- c("Long_mRTE", "Long_aRTE")
+
+num_data <- t20_season_RTE_2023 %>%
+  select(where(is.numeric), -nfl_id)   # drop the ID column
+
+other_vars <- c("total_routes", "target_rate", "receiving_yards_after_catch","air_yds", "air_ypr")
+
+# Rows = the 3 RTE metrics, columns = every other numeric stat
+cor_mat <- cor(num_data[rte_vars], num_data[other_vars],
+               use = "pairwise.complete.obs")
+
+corr_matrix <- cor_mat %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("rte_metric") %>%
+  pivot_longer(-rte_metric, names_to = "stat", values_to = "r") %>%
+  mutate(
+    rte_metric = factor(rte_metric, levels = rev(rte_vars)),  # mRTE on top
+    stat       = factor(stat, levels = other_vars)
+  ) %>%
+  ggplot(aes(stat, rte_metric, fill = r)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(r, 2)), size = 3, fontface = "bold") +
+  scale_fill_gradient2(low = "#D73027", mid = "#FFFFBF", high = "#1A9850",
+                       midpoint = 0, limits = c(-1, 1)) +
+  scale_y_discrete(labels = c(Medium_mRTE = "Long mRTE",
+                              Medium_aRTE = "Long aRTE")) +  # match your gt table label
+  scale_x_discrete(labels = c(
+    total_routes                  = "Routes Run",
+    target_rate                 = "Target Rate",
+    receiving_yards_after_catch = "Yards after Catch",
+    air_yds                   = "Air Yards",
+    air_ypr                     = "Air YPR"
+  )) +
+  labs(x = NULL, y = NULL, fill = "Correlation") +
+  theme_minimal() +
+  theme(
+    text        = element_text(face = "bold"),  # axis labels, legend title and key text
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+    axis.text.y = element_text(face = "bold")
+  )
+
+ggsave("rte_corr.png", corr_matrix, width = 9, height = 3)
+```
+
+```{r}
+MIN_ROUTES <- 15
+# ---- Prep: flag targets/catches; credit air yards (route_depth) on catches only --
+plays_prep <- all_plays %>%
+  filter(player_name != "Trey Palmer") %>% 
+  mutate(
+    is_target = player_role == "Targeted Receiver",
+    is_catch  = is_target & coalesce(pass_result == "C", FALSE),
+    air_gain  = if_else(is_catch, route_depth, 0, missing = 0)
+  )
+
+# Each player's total targets across all route groups (for share_basis = "player")
+player_tgt_totals <- plays_prep %>%
+  group_by(nfl_id) %>%
+  summarize(player_targets_all = sum(is_target), .groups = "drop")
+
+# ---- Table builder -------------------------------------------------------------
+# group:       "Short", "Medium", "Long", or "Ultra-Long"
+# share_basis: "group"  = player's targets / all targets in this route group (Top-20 pool)
+#              "player" = % of the player's own targets that came in this route group
+make_top_mRTE_table <- function(group,
+                                n           = 10,
+                                min_routes  = MIN_ROUTES,
+                                share_basis = c("group", "player"),
+                                save        = TRUE) {
+  share_basis <- match.arg(share_basis)
+
+  grp_plays <- plays_prep %>% filter(route_group == group)
+  if (nrow(grp_plays) == 0) stop("No plays found for route group: ", group)
+
+  # Percentile functions: each receiver's median vs. all play-level values
+  # in the same route group (same approach as the Top-20 table)
+  ecdf_m <- ecdf(grp_plays$peak_frame_efficiency)
+  ecdf_a <- ecdf(grp_plays$avg_play_efficiency)
+
+  group_targets_total <- sum(grp_plays$is_target)
+
+  tab <- grp_plays %>%
+    group_by(player_name, nfl_id) %>%
+    summarize(
+      mRTE_raw = median(peak_frame_efficiency, na.rm = TRUE),
+      aRTE_raw = median(avg_play_efficiency,   na.rm = TRUE),
+      routes   = n(),
+      targets  = sum(is_target),
+      catches  = sum(is_catch),
+      air_yds  = sum(air_gain),
+      .groups  = "drop"
+    ) %>%
+    filter(routes >= min_routes) %>%
+    left_join(player_tgt_totals, by = "nfl_id") %>%
+    mutate(
+      mRTE = ecdf_m(mRTE_raw) * 100,
+      aRTE = ecdf_a(aRTE_raw) * 100,
+      tgt_share = if (share_basis == "group") {
+        targets / group_targets_total
+      } else {
+        if_else(player_targets_all > 0, targets / player_targets_all, 0)
+      },
+      comp_pct     = if_else(targets > 0, catches / targets, NA_real_),
+      yds_per_tgt  = if_else(targets > 0, air_yds / targets, NA_real_)
+    ) %>%
+    arrange(desc(mRTE_raw)) %>%
+    slice_head(n = n) %>%
+    select(player_name, mRTE, aRTE, targets, tgt_share, comp_pct, yds_per_tgt)
+
+  share_label <- if (share_basis == "group") "Target Share" else "% of Player's Targets"
+
+  gt_tbl <- tab %>%
+    gt() %>%
+    tab_header(
+      title    = md(paste0("**Top ", n, " mRTE: ", group, " Routes (2023)**")),
+      subtitle = md(paste0(
+        "mRTE / aRTE: Median route percentile vs. all Top-20 WR routes of the same depth | min ",
+        min_routes, " routes"
+      ))
+    ) %>%
+    cols_label(
+      player_name = "Player",
+      mRTE        = "mRTE",
+      aRTE        = "aRTE",
+      targets     = "Targets",
+      tgt_share   = share_label,
+      comp_pct    = "Comp %",
+      yds_per_tgt = "Air Rec Yds / Tgt"
+    ) %>%
+    fmt_number(columns = c(mRTE, aRTE, yds_per_tgt), decimals = 1) %>%
+    fmt_number(columns = c(targets), decimals = 0) %>%
+    fmt_percent(columns = c(tgt_share, comp_pct), decimals = 1) %>%
+    sub_missing(columns = c(comp_pct, yds_per_tgt), missing_text = "—") %>%
+    data_color(
+      columns  = c(mRTE, aRTE),
+      palette  = c("#D73027", "#FFFFBF", "#1A9850"),
+      domain   = c(0, 100),
+      na_color = "#EEEEEE"
+    ) %>%
+    cols_align(align = "left",   columns = player_name) %>%
+    cols_align(align = "center", columns = c(mRTE, aRTE, targets,
+                                             tgt_share, comp_pct, yds_per_tgt)) %>%
+    opt_row_striping() %>%
+    tab_options(
+      table.font.size           = px(13),
+      heading.title.font.size   = px(16),
+      column_labels.font.weight = "bold"
+    )
+
+  if (save) {
+    gtsave(gt_tbl, filename = paste0("top", n, "_mRTE_", group, "_2023.png"))
+  }
+  gt_tbl
+}
+
+# ---- Run it --------------------------------------------------------------------
+make_top_mRTE_table("Long", share_basis = "player")
+make_top_mRTE_table("Short", share_basis = "player")
+make_top_mRTE_table("Medium", share_basis = "player")
+make_top_mRTE_table("Ultra-Long", share_basis = "player")
 ```

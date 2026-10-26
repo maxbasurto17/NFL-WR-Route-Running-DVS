@@ -19,7 +19,7 @@ library(patchwork)
 library(future)
 library(furrr)
 
-main <- read_csv("~/Documents/Football_R/CMSAC--Field Value/full_data.csv")
+main <- read_csv("~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/full_data.csv")
 
 ```
 
@@ -36,11 +36,26 @@ VALID_PASS_RESULTS <- c("C") # Filter to completed passes to establish reasonabl
 # Lookahead evaluation horizon grid (frames ahead to project/evaluate)
 frames_ahead_grid <- seq(5, 30, by = 5) 
 
+# Train / test split (by WEEK, so every game lives entirely in train or test)
+# - Set TEST_WEEKS to a specific vector (e.g. c(4, 8, 12, 16)) to hand-pick test weeks,
+#   or leave NULL to randomly hold out TEST_WEEK_FRAC of the weeks.
+TEST_WEEKS     <- NULL
+TEST_WEEK_FRAC <- 0.25
+SPLIT_SEED     <- 2026
+
 # =============================================================================
 # 1. Data Cleaning & Line of Scrimmage / Route Depth Calculation
 # =============================================================================
 
 frame_col <- intersect(c("frame_id", "frameId", "frame", "frame_number"), names(main))[1]
+
+# Make sure a `week` column exists. If the data doesn't have one, derive it from the
+# date embedded in game_id (YYYYMMDD##). NFL weeks run Thursday -> Wednesday, so
+# floor(days since the first game / 7) + 1 gives the week number.
+if (!"week" %in% names(main)) {
+  game_dates <- as.Date(substr(as.character(main$game_id), 1, 8), format = "%Y%m%d")
+  main$week  <- as.integer(floor(as.numeric(game_dates - min(game_dates, na.rm = TRUE)) / 7)) + 1L
+}
 
 # Filter pre-pass and valid targets, find throw frame, and calculate route depth relative to LOS
 throw_frames_raw <- main %>%
@@ -53,6 +68,7 @@ throw_frames_raw <- main %>%
   ) %>%
   group_by(game_id, play_id, nfl_id) %>%
   summarise(
+    week            = first(week),
     throw_frame     = max(frame_id, na.rm = TRUE),
     anchor_x        = first(x_std[frame_id == max(frame_id, na.rm = TRUE)]),
     anchor_y        = first(y_std[frame_id == max(frame_id, na.rm = TRUE)]),
@@ -67,9 +83,34 @@ throw_frames_raw <- main %>%
   ) %>%
   mutate(route_depth_yds = anchor_x - los_x_std)
 
-# Compute bounds and assign depth bins dynamically based on release depth
-depth_std_dev  <- sd(throw_frames_raw$route_depth_yds, na.rm = TRUE)
-depth_mean     <- mean(throw_frames_raw$route_depth_yds, na.rm = TRUE)
+# -----------------------------------------------------------------------------
+# Train / test split by week (no game can appear in both sets)
+# -----------------------------------------------------------------------------
+all_weeks <- sort(unique(throw_frames_raw$week))
+
+if (is.null(TEST_WEEKS)) {
+  set.seed(SPLIT_SEED)
+  TEST_WEEKS <- sort(sample(all_weeks, size = max(1, round(length(all_weeks) * TEST_WEEK_FRAC))))
+}
+TRAIN_WEEKS <- setdiff(all_weeks, TEST_WEEKS)
+
+throw_frames_raw <- throw_frames_raw %>%
+  mutate(split = if_else(week %in% TEST_WEEKS, "test", "train"))
+
+# Safety check: no game_id shared between train and test
+train_games <- unique(throw_frames_raw$game_id[throw_frames_raw$split == "train"])
+test_games  <- unique(throw_frames_raw$game_id[throw_frames_raw$split == "test"])
+stopifnot("Games overlap between train and test!" = length(intersect(train_games, test_games)) == 0)
+
+cat("Train weeks:", paste(TRAIN_WEEKS, collapse = ", "), "\n")
+cat("Test weeks: ", paste(TEST_WEEKS,  collapse = ", "), "\n")
+cat("Train: ", length(train_games), "games,", sum(throw_frames_raw$split == "train"), "plays\n")
+cat("Test:  ", length(test_games),  "games,", sum(throw_frames_raw$split == "test"),  "plays\n")
+
+# Compute bounds from TRAIN plays only, then apply those same breaks to train + test
+train_depths   <- throw_frames_raw$route_depth_yds[throw_frames_raw$split == "train"]
+depth_std_dev  <- sd(train_depths, na.rm = TRUE)
+depth_mean     <- mean(train_depths, na.rm = TRUE)
 plus1_std_dev  <- depth_mean + depth_std_dev
 minus1_std_dev <- depth_mean - depth_std_dev
 
@@ -115,7 +156,7 @@ base_geom_df <- throw_frames %>%
 build_path_geometry <- function(n_frames_ahead) {
   if (nrow(base_geom_df) == 0) return(NULL)
 
-  pmap_dfr(base_geom_df, function(game_id, play_id, nfl_id, pass_depth_bin, anchor_x, anchor_y,
+  pmap_dfr(base_geom_df, function(game_id, play_id, nfl_id, split, pass_depth_bin, anchor_x, anchor_y,
                                   ball_land_x_std, ball_land_y_std, px, py, ...) {
 
     path_x <- unlist(px)
@@ -154,6 +195,7 @@ build_path_geometry <- function(n_frames_ahead) {
 
     tibble(
       game_id = game_id, play_id = play_id, nfl_id = nfl_id,
+      split = split,
       pass_depth_bin = pass_depth_bin,
       min_dist = dist, arc_along = arc_along, proj_len = proj_len, 
       back_along = back_along, back_perp = back_perp
@@ -202,7 +244,8 @@ results <- future_pmap_dfr(param_grid, function(target_bin, backward_cushion, co
   geom <- geom_by_n[[as.character(frames_ahead)]]
   if (is.null(geom) || nrow(geom) == 0) return(NULL)
   
-  geom_bin <- geom %>% filter(as.character(pass_depth_bin) == target_bin)
+  # Calibrate on TRAIN plays only
+  geom_bin <- geom %>% filter(split == "train", as.character(pass_depth_bin) == target_bin)
   if (nrow(geom_bin) == 0) return(NULL)
   
   evaluate_bw(geom_bin, backward_cushion, corridor_width, frames_ahead)
@@ -251,7 +294,7 @@ all_geoms <- bind_rows(lapply(names(geom_by_n), function(f_ahead) {
 
 play_results <- throw_frames %>%
   inner_join(best_per_bin, by = "pass_depth_bin") %>%
-  inner_join(all_geoms, by = c("game_id", "play_id", "nfl_id", "frames_ahead", "pass_depth_bin")) %>%
+  inner_join(all_geoms %>% select(-split), by = c("game_id", "play_id", "nfl_id", "frames_ahead", "pass_depth_bin")) %>%
   mutate(
     in_forward_tube  = min_dist <= corridor_width & arc_along >= 0 & arc_along <= proj_len,
     in_backward_zone = back_along >= 0 & back_along <= backward_cushion & back_perp <= corridor_width,
@@ -259,7 +302,7 @@ play_results <- throw_frames %>%
   )
 
 coverage_by_depth <- play_results %>%
-  group_by(pass_depth_bin) %>%
+  group_by(split, pass_depth_bin) %>%
   summarise(
     total_plays    = n(),
     opt_width      = mean(corridor_width),
@@ -267,9 +310,48 @@ coverage_by_depth <- play_results %>%
     coverage_pct   = mean(inside),
     mean_area      = mean(area),
     .groups        = "drop"
-  )
+  ) %>%
+  arrange(desc(split), pass_depth_bin)
 
+cat("\n=== COVERAGE BY SPLIT AND DEPTH BIN ===\n")
 print(coverage_by_depth)
+
+# Overall coverage (all depth bins pooled), train vs. test
+overall_coverage <- play_results %>%
+  group_by(split) %>%
+  summarise(
+    total_plays  = n(),
+    coverage_pct = mean(inside),
+    .groups      = "drop"
+  )
+cat("\n=== OVERALL COVERAGE: TRAIN vs TEST ===\n")
+print(overall_coverage)
+
+# Generalization gap: how far does test coverage fall from train coverage?
+coverage_gap <- coverage_by_depth %>%
+  select(split, pass_depth_bin, total_plays, coverage_pct) %>%
+  pivot_wider(names_from = split, values_from = c(total_plays, coverage_pct)) %>%
+  mutate(
+    gap_test_minus_train = coverage_pct_test - coverage_pct_train,
+    test_meets_target    = coverage_pct_test >= target_coverage
+  )
+cat("\n=== GENERALIZATION GAP (test - train coverage) ===\n")
+print(coverage_gap)
+
+p_coverage_split <- ggplot(coverage_by_depth, aes(x = pass_depth_bin, y = coverage_pct, fill = split)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_hline(yintercept = target_coverage, linetype = "dashed", color = "firebrick") +
+  geom_text(aes(label = percent(coverage_pct, accuracy = 0.1)),
+            position = position_dodge(width = 0.8), vjust = -0.4, size = 3.2) +
+  scale_y_continuous(labels = percent, limits = c(0, 1.05)) +
+  scale_fill_manual(values = c(train = "steelblue", test = "darkorange")) +
+  labs(
+    title = "Envelope Coverage: Train vs. Held-Out Test Weeks",
+    subtitle = paste0("Dashed line = ", percent(target_coverage), " target coverage"),
+    x = "Pass Depth Bin", y = "Coverage", fill = "Split"
+  ) +
+  theme_minimal()
+print(p_coverage_split)
 
 # =============================================================================
 # 7. Pre-Pass Animation Helper Fix
@@ -333,7 +415,10 @@ get_frame_polygon <- function(player_path, current_frame, backward_cushion, corr
 # 8. Spatial Diagnostic Plots & Residual Analysis
 # =============================================================================
 
+# Residual diagnostics below use TRAIN plays (the data the parameters were fit on);
+# a matching test-set check follows after the diagnostic panel.
 residual_data <- play_results %>%
+  filter(split == "train") %>%
   filter(!is.na(min_dist), !is.na(route_depth_yds), !is.na(arc_along), !is.na(proj_len)) %>%
   arrange(route_depth_yds) %>%
   mutate(
@@ -406,6 +491,23 @@ residual_diagnostics <- (p_res_vs_depth | p_res_density) / (p_qq | p_long_res) +
 
 print(residual_diagnostics)
 
+# Held-out test check: lateral error distribution vs. the corridor widths chosen on train
+test_residual_data <- play_results %>%
+  filter(split == "test", !is.na(min_dist))
+
+p_test_lateral <- ggplot(test_residual_data, aes(x = min_dist)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 35, fill = "darkorange", alpha = 0.6, color = "white") +
+  geom_density(color = "darkblue", linewidth = 1) +
+  geom_vline(data = best_per_bin, aes(xintercept = corridor_width, color = pass_depth_bin),
+             linetype = "dashed", linewidth = 0.8) +
+  labs(
+    title = "Held-Out Test Weeks: Distribution of Lateral Errors",
+    subtitle = "Dashed lines = corridor widths calibrated on train weeks",
+    x = "Perpendicular Error (Yards)", y = "Density", color = "Depth Bin"
+  ) +
+  theme_minimal()
+print(p_test_lateral)
+
 ```
 
 # Save Files
@@ -417,7 +519,9 @@ print(residual_diagnostics)
 envelope_model <- list(
   parameters = best_per_bin %>% select(pass_depth_bin, backward_cushion, corridor_width, frames_ahead),
   breaks     = c(-Inf, minus1_std_dev, plus1_std_dev, Inf),
-  labels     = c("Short", "Medium", "Deep")
+  labels     = c("Short", "Medium", "Deep"),
+  train_weeks = TRAIN_WEEKS,
+  test_weeks  = TEST_WEEKS
 )
 saveRDS(envelope_model, "optimal_envelope_parameters.rds")
 ```

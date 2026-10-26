@@ -6,6 +6,16 @@ library(ggplot2)
 library(splines)
 
 # =============================================================================
+# 0. SPLIT CONFIG (same settings as reasonable_pass_bounds_v2_split.Rmd)
+# =============================================================================
+# Train / test split by WEEK, so every game lives entirely in train or test.
+# - Set TEST_WEEKS to a specific vector (e.g. c(4, 8, 12, 16)) to hand-pick test weeks,
+#   or leave NULL to randomly hold out TEST_WEEK_FRAC of the weeks.
+TEST_WEEKS     <- NULL
+TEST_WEEK_FRAC <- 0.25
+SPLIT_SEED     <- 2026
+
+# =============================================================================
 # 1. PREPARE DATA & TRAIN / TEST SPLIT
 # =============================================================================
 processed_data <- completed_pass_bounds %>%
@@ -15,10 +25,40 @@ processed_data <- completed_pass_bounds %>%
     err_y = ball_land_y_std - y_std
   )
 
-set.seed(42)
-train_idx  <- sample(seq_len(nrow(processed_data)), size = floor(0.80 * nrow(processed_data)))
-train_data <- processed_data[train_idx, ]
-test_data  <- processed_data[-train_idx, ]
+# Make sure a `week` column exists. If the data doesn't have one, derive it from the
+# date embedded in game_id (YYYYMMDD##). NFL weeks run Thursday -> Wednesday, so
+# floor(days since the first game / 7) + 1 gives the week number.
+if (!"week" %in% names(processed_data)) {
+  game_dates <- as.Date(substr(as.character(processed_data$game_id), 1, 8), format = "%Y%m%d")
+  processed_data$week <- as.integer(floor(as.numeric(game_dates - min(game_dates, na.rm = TRUE)) / 7)) + 1L
+}
+
+# -----------------------------------------------------------------------------
+# Train / test split by week (no game can appear in both sets)
+# -----------------------------------------------------------------------------
+all_weeks <- sort(unique(processed_data$week))
+
+if (is.null(TEST_WEEKS)) {
+  set.seed(SPLIT_SEED)
+  TEST_WEEKS <- sort(sample(all_weeks, size = max(1, round(length(all_weeks) * TEST_WEEK_FRAC))))
+}
+TRAIN_WEEKS <- setdiff(all_weeks, TEST_WEEKS)
+
+processed_data <- processed_data %>%
+  mutate(split = if_else(week %in% TEST_WEEKS, "test", "train"))
+
+train_data <- processed_data %>% filter(split == "train")
+test_data  <- processed_data %>% filter(split == "test")
+
+# Safety check: no game_id shared between train and test
+train_games <- unique(train_data$game_id)
+test_games  <- unique(test_data$game_id)
+stopifnot("Games overlap between train and test!" = length(intersect(train_games, test_games)) == 0)
+
+cat("Train weeks:", paste(TRAIN_WEEKS, collapse = ", "), "\n")
+cat("Test weeks: ", paste(TEST_WEEKS,  collapse = ", "), "\n")
+cat("Train: ", length(train_games), "games,", nrow(train_data), "plays\n")
+cat("Test:  ", length(test_games),  "games,", nrow(test_data),  "plays\n")
 
 # --- RIGOROUS BIAS CALCULATION (FIT ON TRAIN DATA ONLY) ---
 v_test_train <- t.test(train_data$err_x)
@@ -228,7 +268,9 @@ if (winning_model_found) {
     winning_shape = winning_shape,
     winning_tau_x = winning_tau_x,
     winning_tau_y = winning_tau_y,
-    lead_bias = final_lead_bias
+    lead_bias = final_lead_bias,
+    train_weeks = TRAIN_WEEKS,
+    test_weeks  = TEST_WEEKS
   )
   
   save_path <- "~/Documents/Sports Analytics/2026 CMSAC RRC/pitch_control_spline_model.rds"

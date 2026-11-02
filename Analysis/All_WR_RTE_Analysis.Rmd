@@ -1,0 +1,991 @@
+---
+title: "All_WR_RTE_Analysis"
+output: html_document
+---
+
+EDA / analysis of route threat efficiency (RTE) for every WR in `all_wr_play_coverage_efficiency.csv`.
+
+Metric definitions (same as the Top-20 analysis):
+
+* **mRTE** = median `peak_frame_efficiency` per receiver x route group
+* **aRTE** = median `avg_play_efficiency`
+* **fRTE** = median `final_frame_efficiency`
+* Percentiles compare a receiver's median against every WR route of the same route group in the dataset.
+
+# 0. Setup and config
+
+```{r setup}
+library(tidyverse)
+library(gt)
+
+CFG <- list(
+  # ---- paths ----
+  data_dir   = "~/Documents/Football_R/CMSAC--Field Value/",
+  full_data  = "full_data.csv",
+  pbp_file   = "PBP_Efficiency/all_wr_play_coverage_efficiency.csv",
+  meta_cache = "all_wr_route_meta.rds",     # cache of the full_data join (built once)
+  rebuild_meta = FALSE,                     # TRUE = rebuild the cache from full_data.csv
+  out_dir    = "~/Documents/Football_R/CMSAC--Field Value/Analysis/all_wr_figs",
+
+  # ---- route groups ----
+  route_groups = c("Short", "Medium", "Long", "Ultra-Long"),
+  # ONLY used if full_data has no route_group column: [-Inf,5) [5,10) [10,20) [20,Inf)
+  depth_breaks = c(-Inf, 5, 12, 20, Inf),
+
+  # ---- sample-size rules ----
+  min_routes_split = 20,    # per season half, per route group (split-half correlations)
+  min_wr_corr      = 15,    # drop a route group from the matrix if fewer WRs qualify
+  min_routes_table = 25,    # top-10 tables
+  min_routes_model = 30,    # scatterplots + regressions
+  min_n_model      = 12,    # skip a regression if fewer WRs than this
+
+  # ---- misc ----
+  split_method = "season",  # "season" = league-wide midpoint of the schedule
+                            # "player" = each WR's own median game (old Top-20 approach)
+  top_n = 10
+)
+
+OUT_DIR <- path.expand(CFG$out_dir)
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# shared look
+RTE_PALETTE <- c("#D73027", "#FFFFBF", "#1A9850")
+theme_rte <- function() {
+  theme_minimal() +
+    theme(text = element_text(face = "bold"),
+          strip.text = element_text(face = "bold"),
+          panel.grid.minor = element_blank())
+}
+```
+
+# 1. Build the play-level analysis table
+
+Everything not in the efficiency CSV is derived from `full_data.csv`, once, and cached:
+
+* `player_role`, `pass_result`: targets and catches
+* `route_depth`, `route_group`: used as-is if they exist in `full_data`; otherwise derived (see `build_route_meta`)
+* `separation`: distance (yards) from the WR to the closest defender in the **last pre-pass frame** (time of throw), computed for every route
+
+```{r data-prep}
+build_route_meta <- function(cfg, wr_ids) {
+  path   <- file.path(path.expand(cfg$data_dir), cfg$full_data)
+  header <- names(readr::read_csv(path, n_max = 0, show_col_types = FALSE))
+
+  required <- c("game_id", "play_id", "frame_id", "nfl_id", "player_side", "player_role",
+                "phase", "x_std", "y_std", "los_x_std", "pass_result")
+  optional <- c("route_depth", "route_group", "ball_land_x_std")
+
+  missing_req <- setdiff(required, header)
+  if (length(missing_req) > 0) {
+    stop("full_data is missing required columns: ", paste(missing_req, collapse = ", "))
+  }
+
+  raw <- readr::read_csv(path, col_select = dplyr::any_of(c(required, optional)),
+                         show_col_types = FALSE, progress = FALSE)
+  pre <- raw %>%
+    filter(phase == "pre_pass", !is.na(nfl_id), !is.na(x_std), !is.na(y_std))
+  rm(raw); invisible(gc(verbose = FALSE))
+
+  # Time of throw = last pre_pass frame of each play
+  throw <- pre %>%
+    group_by(game_id, play_id) %>%
+    filter(frame_id == max(frame_id)) %>%
+    ungroup()
+
+  # --- traditional separation: nearest defender at the throw frame ---
+  off <- throw %>%
+    filter(tolower(player_side) == "offense", nfl_id %in% wr_ids) %>%
+    select(game_id, play_id, nfl_id, x_std, y_std)
+  def <- throw %>%
+    filter(tolower(player_side) == "defense") %>%
+    select(game_id, play_id, dx = x_std, dy = y_std)
+
+  separation <- off %>%
+    inner_join(def, by = c("game_id", "play_id"), relationship = "many-to-many") %>%
+    mutate(d = sqrt((x_std - dx)^2 + (y_std - dy)^2)) %>%
+    group_by(game_id, play_id, nfl_id) %>%
+    summarize(separation = min(d), .groups = "drop")
+
+  # --- per-route metadata at the throw frame ---
+  meta <- throw %>%
+    filter(nfl_id %in% wr_ids) %>%
+    select(game_id, play_id, nfl_id, player_role, pass_result, los_x_std, any_of(optional))
+
+  # --- route_depth fallback (only if full_data has none) ---
+  if (!"route_depth" %in% names(meta)) {
+    message("route_depth not found in full_data: deriving it. ",
+            "Targets = ball landing depth (if ball_land_x_std exists), otherwise max depth reached pre-pass.")
+    max_depth <- pre %>%
+      filter(nfl_id %in% wr_ids) %>%
+      group_by(game_id, play_id, nfl_id) %>%
+      summarize(max_depth = max(x_std - los_x_std, na.rm = TRUE), .groups = "drop")
+    meta <- left_join(meta, max_depth, by = c("game_id", "play_id", "nfl_id"))
+
+    is_tgt <- coalesce(meta$player_role == "Targeted Receiver", FALSE)
+    if ("ball_land_x_std" %in% names(meta)) {
+      meta$route_depth <- if_else(is_tgt & !is.na(meta$ball_land_x_std),
+                                  meta$ball_land_x_std - meta$los_x_std, meta$max_depth)
+    } else {
+      meta$route_depth <- meta$max_depth
+    }
+  }
+
+  # --- route_group fallback ---
+  if (!"route_group" %in% names(meta)) {
+    message("route_group not found in full_data: cutting route_depth at ",
+            paste(cfg$depth_breaks[-c(1, length(cfg$depth_breaks))], collapse = " / "), " yards.")
+    meta$route_group <- as.character(cut(meta$route_depth, breaks = cfg$depth_breaks,
+                                         labels = cfg$route_groups, right = FALSE))
+  }
+
+  meta %>%
+    select(game_id, play_id, nfl_id, player_role, pass_result, route_depth, route_group) %>%
+    mutate(route_group = as.character(route_group)) %>%
+    left_join(separation, by = c("game_id", "play_id", "nfl_id"))
+}
+
+load_plays <- function(cfg) {
+  pbp <- readr::read_csv(file.path(path.expand(cfg$data_dir), cfg$pbp_file), show_col_types = FALSE)
+
+  cache <- file.path(path.expand(cfg$data_dir), cfg$meta_cache)
+  if (file.exists(cache) && !cfg$rebuild_meta) {
+    message("Using cached route metadata: ", cache)
+    meta <- readRDS(cache)
+  } else {
+    meta <- build_route_meta(cfg, wr_ids = unique(pbp$nfl_id))
+    saveRDS(meta, cache)
+  }
+
+  plays <- pbp %>%
+    left_join(meta, by = c("game_id", "play_id", "nfl_id")) %>%
+    mutate(
+      is_target = coalesce(player_role == "Targeted Receiver", FALSE),
+      is_catch  = is_target & coalesce(pass_result == "C", FALSE),
+      air_gain  = if_else(is_catch, route_depth, 0, missing = 0)   # air yards credited on catches only
+    )
+
+  n_drop <- sum(is.na(plays$route_group) | !plays$route_group %in% cfg$route_groups)
+  if (n_drop > 0) message(n_drop, " WR-plays have no usable route_group and are dropped.")
+
+  plays %>%
+    filter(route_group %in% cfg$route_groups) %>%
+    mutate(route_group = factor(route_group, levels = cfg$route_groups))
+}
+
+plays <- load_plays(CFG)
+
+# ---- sanity checks: eyeball these before trusting anything below ----
+plays %>%
+  group_by(route_group) %>%
+  summarize(routes = n(), wrs = n_distinct(nfl_id), targets = sum(is_target),
+            catches = sum(is_catch), med_depth = median(route_depth, na.rm = TRUE),
+            med_separation = median(separation, na.rm = TRUE),
+            pct_missing_sep = mean(is.na(separation)), .groups = "drop")
+```
+
+```{r season-rte}
+# One row per receiver x route group, season-long
+summarize_season <- function(plays) {
+  plays %>%
+    group_by(nfl_id, player_name, route_group) %>%
+    summarize(
+      mRTE_raw   = median(peak_frame_efficiency),
+      aRTE_raw   = median(avg_play_efficiency),
+      fRTE_raw   = median(final_frame_efficiency),
+      separation = median(separation, na.rm = TRUE),
+      routes     = n(),
+      targets    = sum(is_target),
+      catches    = sum(is_catch),
+      air_yds    = sum(air_gain),
+      .groups    = "drop"
+    ) %>%
+    mutate(target_rate = targets / routes)
+}
+
+# Convert raw medians to percentiles within the route group (play-level ECDF over all WR routes)
+add_percentiles <- function(season, plays) {
+  pctl <- function(raw, grp, col) {
+    out <- rep(NA_real_, length(raw))
+    for (g in unique(as.character(grp))) {
+      f   <- ecdf(plays[[col]][as.character(plays$route_group) == g])
+      idx <- as.character(grp) == g
+      out[idx] <- f(raw[idx]) * 100
+    }
+    out
+  }
+  season %>%
+    mutate(
+      mRTE = pctl(mRTE_raw, route_group, "peak_frame_efficiency"),
+      aRTE = pctl(aRTE_raw, route_group, "avg_play_efficiency"),
+      fRTE = pctl(fRTE_raw, route_group, "final_frame_efficiency")
+    )
+}
+
+season_rte <- plays %>% summarize_season() %>% add_percentiles(plays)
+```
+
+# 2. Split-half reliability of RTE
+
+WRs need at least `min_routes_split` routes of a route group in **each** half. Route groups with fewer than `min_wr_corr` qualifying WRs are dropped automatically (expected for Ultra-Long). Correlations use raw medians; Spearman (equivalent to percentile ranks) and the Spearman-Brown full-length estimate are printed as well.
+
+```{r split-half}
+assign_half <- function(plays, method) {
+  if (method == "season") {
+    cutoff <- median(unique(plays$game_id))   # game_id is date-ordered (yyyymmddNN)
+    plays %>% mutate(half = if_else(game_id <= cutoff, "H1", "H2"))
+  } else {
+    plays %>%
+      group_by(nfl_id) %>%
+      mutate(half = if_else(game_id <= median(game_id), "H1", "H2")) %>%
+      ungroup()
+  }
+}
+
+split_half_cor <- function(plays, cfg) {
+  metrics <- c("mRTE", "aRTE", "fRTE")
+
+  halves <- assign_half(plays, cfg$split_method) %>%
+    group_by(nfl_id, player_name, route_group, half) %>%
+    summarize(mRTE = median(peak_frame_efficiency),
+              aRTE = median(avg_play_efficiency),
+              fRTE = median(final_frame_efficiency),
+              routes = n(), .groups = "drop") %>%
+    pivot_wider(names_from = half, values_from = c(mRTE, aRTE, fRTE, routes),
+                names_glue = "{.value}_{half}") %>%
+    filter(routes_H1 >= cfg$min_routes_split, routes_H2 >= cfg$min_routes_split)
+
+  res <- map_dfr(cfg$route_groups, function(g) {
+    d <- halves %>% filter(route_group == g)
+    map_dfr(metrics, function(m) {
+      a <- d[[paste0(m, "_H1")]]
+      b <- d[[paste0(m, "_H2")]]
+      ok <- nrow(d) >= 3
+      tibble(route_group = g, metric = m, n = nrow(d),
+             r   = if (ok) cor(a, b) else NA_real_,
+             rho = if (ok) cor(a, b, method = "spearman") else NA_real_)
+    })
+  }) %>%
+    mutate(r_spearman_brown = 2 * r / (1 + r))
+
+  dropped <- res %>% filter(n < cfg$min_wr_corr) %>% pull(route_group) %>% unique()
+  if (length(dropped) > 0) {
+    message("Dropped from the split-half matrix (fewer than ", cfg$min_wr_corr,
+            " WRs with >= ", cfg$min_routes_split, " routes in each half): ",
+            paste(dropped, collapse = ", "))
+  }
+  res %>% filter(n >= cfg$min_wr_corr)
+}
+
+split_half <- split_half_cor(plays, CFG)
+split_half %>% mutate(across(c(r, rho, r_spearman_brown), ~ round(.x, 3)))
+```
+
+```{r split-half-plot}
+keep_groups <- CFG$route_groups[CFG$route_groups %in% split_half$route_group]
+
+split_half_plot <- split_half %>%
+  mutate(route_group = factor(route_group, levels = keep_groups),
+         metric      = factor(metric, levels = rev(c("mRTE", "aRTE", "fRTE")))) %>%
+  ggplot(aes(route_group, metric, fill = r)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f\n(n = %d)", r, n)), size = 3.6, fontface = "bold") +
+  scale_fill_gradient2(low = RTE_PALETTE[1], mid = RTE_PALETTE[2], high = RTE_PALETTE[3],
+                       midpoint = 0, limits = c(-1, 1)) +
+  labs(title = "RTE split-half reliability (first vs. second half of 2023)",
+       subtitle = paste0("Min ", CFG$min_routes_split, " routes of the route group in each half | ",
+                         if (CFG$split_method == "season") "league-wide season midpoint" else "per-WR median game"),
+       x = NULL, y = NULL, fill = "Split-half r") +
+  theme_rte()
+
+ggsave(file.path(OUT_DIR, "rte_split_half_corr.png"), split_half_plot, width = 8, height = 3.6)
+split_half_plot
+```
+
+# 3. RTE vs. air receiving yards
+
+Season air receiving yards in each route group (route depth credited on catches) against the three RTE percentiles. Total air yards also scale with routes run, so a per-route version follows.
+
+```{r rte-vs-air}
+model_df <- season_rte %>%
+  filter(routes >= CFG$min_routes_model)
+
+rte_long <- model_df %>%
+  pivot_longer(c(mRTE, aRTE, fRTE), names_to = "metric", values_to = "rte") %>%
+  mutate(metric = factor(metric, levels = c("mRTE", "aRTE", "fRTE")),
+         air_yds_per_route = air_yds / routes)
+
+plot_rte_vs_air <- function(df, yvar, ylab, title, file) {
+  labs_df <- df %>%
+    group_by(route_group, metric) %>%
+    summarize(r = cor(rte, .data[[yvar]], use = "complete.obs"), n = n(), .groups = "drop") %>%
+    mutate(label = sprintf("r = %.2f\nn = %d", r, n))
+
+  p <- ggplot(df, aes(rte, .data[[yvar]])) +
+    geom_point(color = "#1A9850", alpha = 0.75, size = 2) +
+    geom_smooth(method = "lm", formula = y ~ x, se = TRUE, color = "#D73027",
+                fill = "#D73027", alpha = 0.15, linewidth = 0.9) +
+    geom_text(data = labs_df, aes(x = -Inf, y = Inf, label = label),
+              hjust = -0.1, vjust = 1.2, size = 3.2, fontface = "bold", inherit.aes = FALSE) +
+    facet_grid(metric ~ route_group, scales = "free_y") +
+    scale_x_continuous(limits = c(0, 100)) +
+    labs(title = title,
+         subtitle = paste0("Each point = one WR | min ", CFG$min_routes_model, " routes in the route group"),
+         x = "RTE percentile within route group", y = ylab) +
+    theme_rte()
+
+  ggsave(file.path(OUT_DIR, file), p, width = 12, height = 8)
+  p
+}
+
+plot_rte_vs_air(rte_long, "air_yds", "Air receiving yards (season)",
+                "RTE vs. air receiving yards by route group", "rte_vs_air_yards.png")
+
+plot_rte_vs_air(rte_long, "air_yds_per_route", "Air receiving yards per route",
+                "RTE vs. air receiving yards per route", "rte_vs_air_yards_per_route.png")
+```
+
+# 4. Top-10 mRTE tables by route group
+
+```{r top10-tables}
+player_tgt_totals <- plays %>%
+  group_by(nfl_id) %>%
+  summarize(player_targets_all = sum(is_target), .groups = "drop")
+
+make_top_mRTE_table <- function(group, n = CFG$top_n, min_routes = CFG$min_routes_table, save = TRUE) {
+  tab <- season_rte %>%
+    filter(route_group == group, routes >= min_routes) %>%
+    left_join(player_tgt_totals, by = "nfl_id") %>%
+    mutate(
+      tgt_share   = if_else(player_targets_all > 0, targets / player_targets_all, 0),  # % of player's own targets
+      comp_pct    = if_else(targets > 0, catches / targets, NA_real_),
+      yds_per_tgt = if_else(targets > 0, air_yds / targets, NA_real_)
+    ) %>%
+    arrange(desc(mRTE_raw)) %>%
+    slice_head(n = n) %>%
+    select(player_name, mRTE, aRTE, targets, tgt_share, comp_pct, yds_per_tgt)
+
+  gt_tbl <- tab %>%
+    gt() %>%
+    tab_header(
+      title    = md(paste0("**Top ", n, " mRTE: ", group, " Routes (2023)**")),
+      subtitle = md(paste0("mRTE / aRTE: Median route percentile vs. all WR routes of the same depth | min ",
+                           min_routes, " routes"))
+    ) %>%
+    cols_label(player_name = "Player", mRTE = "mRTE", aRTE = "aRTE", targets = "Targets",
+               tgt_share = "% of Player's Targets", comp_pct = "Comp %",
+               yds_per_tgt = "Air Rec Yds / Tgt") %>%
+    fmt_number(columns = c(mRTE, aRTE, yds_per_tgt), decimals = 1) %>%
+    fmt_number(columns = targets, decimals = 0) %>%
+    fmt_percent(columns = c(tgt_share, comp_pct), decimals = 1) %>%
+    sub_missing(columns = c(comp_pct, yds_per_tgt), missing_text = "—") %>%
+    data_color(columns = c(mRTE, aRTE), palette = RTE_PALETTE, domain = c(0, 100), na_color = "#EEEEEE") %>%
+    cols_align(align = "left", columns = player_name) %>%
+    cols_align(align = "center", columns = c(mRTE, aRTE, targets, tgt_share, comp_pct, yds_per_tgt)) %>%
+    opt_row_striping() %>%
+    tab_options(table.font.size = px(13), heading.title.font.size = px(16),
+                column_labels.font.weight = "bold")
+
+  if (save) gtsave(gt_tbl, filename = file.path(OUT_DIR, paste0("top", n, "_mRTE_", group, "_2023.png")))
+  gt_tbl
+}
+
+make_top_mRTE_table("Short")
+make_top_mRTE_table("Medium")
+make_top_mRTE_table("Long")
+make_top_mRTE_table("Ultra-Long")
+```
+
+# 5. Is RTE a better predictor of air receiving yards than separation?
+
+For each route group, one linear model per feature, all fit on the same WRs:
+
+* **Baseline:** `air_yds ~ routes`
+* **Additive:** `air_yds ~ routes + feature`
+* **Interaction:** `air_yds ~ routes * feature`
+* Features: `mRTE`, `aRTE`, `fRTE` (percentiles) and `separation` (median yards to the nearest defender at throw, over all routes in the group). Features are z-scored so `beta_z` is the change in air yards per +1 SD.
+* Comparison metrics: adjusted R², leave-one-out RMSE (`loocv_rmse`, the honest out-of-sample number), AIC, and an F-test against the routes-only baseline.
+
+```{r regression}
+fit_group_models <- function(d, g, cfg) {
+  d <- d %>%
+    drop_na(air_yds, routes, mRTE, aRTE, fRTE, separation) %>%
+    mutate(across(c(mRTE, aRTE, fRTE, separation), ~ as.numeric(scale(.x))))
+
+  if (nrow(d) < cfg$min_n_model) {
+    message("Skipping ", g, ": only ", nrow(d), " WRs (need ", cfg$min_n_model, ").")
+    return(NULL)
+  }
+
+  base      <- lm(air_yds ~ routes, data = d)
+  base_adj  <- summary(base)$adj.r.squared
+  loocv     <- function(fit) sqrt(mean((residuals(fit) / (1 - hatvalues(fit)))^2))
+
+  one <- function(feature, form) {
+    f   <- if (form == "Additive") paste("air_yds ~ routes +", feature)
+           else                    paste("air_yds ~ routes *", feature)
+    fit <- lm(as.formula(f), data = d)
+    adj <- summary(fit)$adj.r.squared
+    tibble(route_group = g, feature = feature, form = form, n = nobs(fit),
+           adj_r2 = adj, d_adj_r2 = adj - base_adj,
+           loocv_rmse = loocv(fit), aic = AIC(fit),
+           p_vs_routes_only = anova(base, fit)[2, "Pr(>F)"],
+           beta_z = if (form == "Additive") unname(coef(fit)[feature]) else NA_real_)
+  }
+
+  grid <- expand_grid(feature = c("mRTE", "aRTE", "fRTE", "separation"),
+                      form    = c("Additive", "Interaction"))
+
+  bind_rows(
+    tibble(route_group = g, feature = "routes only", form = "Baseline", n = nobs(base),
+           adj_r2 = base_adj, d_adj_r2 = 0, loocv_rmse = loocv(base), aic = AIC(base),
+           p_vs_routes_only = NA_real_, beta_z = NA_real_),
+    bind_rows(pmap(grid, one))
+  )
+}
+
+model_results <- map_dfr(CFG$route_groups, function(g) {
+  fit_group_models(model_df %>% filter(route_group == g), g, CFG)
+}) %>%
+  mutate(route_group = factor(route_group, levels = CFG$route_groups),
+         type = case_when(feature == "separation" ~ "Separation",
+                          feature == "routes only" ~ "Baseline",
+                          TRUE ~ "RTE")) %>%
+  group_by(route_group, form) %>%
+  mutate(rank_loocv = if_else(form == "Baseline", NA_integer_, as.integer(rank(loocv_rmse)))) %>%
+  ungroup()
+```
+
+```{r regression-table}
+reg_gt <- model_results %>%
+  arrange(route_group, factor(form, levels = c("Baseline", "Additive", "Interaction")), loocv_rmse) %>%
+  select(route_group, form, feature, n, adj_r2, d_adj_r2, loocv_rmse, aic, p_vs_routes_only, beta_z) %>%
+  gt(groupname_col = "route_group") %>%
+  tab_header(
+    title    = md("**Predicting season air receiving yards by route group**"),
+    subtitle = md("Each model = routes run + one feature (additive or interaction) | WR-level, 2023")
+  ) %>%
+  cols_label(form = "Form", feature = "Feature", n = "WRs", adj_r2 = "Adj R²",
+             d_adj_r2 = "Δ Adj R²", loocv_rmse = "LOO RMSE", aic = "AIC",
+             p_vs_routes_only = "p vs. routes-only", beta_z = "β (per SD)") %>%
+  fmt_number(columns = c(adj_r2, d_adj_r2), decimals = 3) %>%
+  fmt_number(columns = c(loocv_rmse, aic, beta_z), decimals = 1) %>%
+  fmt_number(columns = p_vs_routes_only, decimals = 3) %>%
+  sub_missing(columns = everything(), missing_text = "—") %>%
+  data_color(columns = d_adj_r2, palette = RTE_PALETTE, domain = c(-0.1, 0.1), na_color = "#EEEEEE") %>%
+  opt_row_striping() %>%
+  tab_options(table.font.size = px(12), heading.title.font.size = px(16),
+              column_labels.font.weight = "bold", row_group.font.weight = "bold")
+
+gtsave(reg_gt, filename = file.path(OUT_DIR, "air_yards_regression_table.png"))
+reg_gt
+```
+
+```{r regression-plots}
+# Head to head: best RTE feature (by adjusted R2) vs. separation, per route group and model form
+head_to_head <- model_results %>%
+  filter(form != "Baseline") %>%
+  group_by(route_group, form, type) %>%
+  slice_max(adj_r2, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(route_group, form, type, feature, adj_r2, loocv_rmse) %>%
+  pivot_wider(names_from = type, values_from = c(feature, adj_r2, loocv_rmse)) %>%
+  mutate(rte_wins_loocv = loocv_rmse_RTE < loocv_rmse_Separation,
+         adj_r2_gap = adj_r2_RTE - adj_r2_Separation)
+
+# NOTE: "best of 3 RTE metrics" gets a small selection advantage over the single separation feature.
+head_to_head %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+baseline_df <- model_results %>%
+  filter(form == "Baseline") %>%
+  select(route_group, base_adj_r2 = adj_r2)
+
+reg_plot <- model_results %>%
+  filter(form != "Baseline") %>%
+  mutate(feature = factor(feature, levels = c("mRTE", "aRTE", "fRTE", "separation"))) %>%
+  ggplot(aes(feature, adj_r2, fill = type)) +
+  geom_col(width = 0.7) +
+  geom_hline(data = baseline_df, aes(yintercept = base_adj_r2), linetype = "dashed", linewidth = 0.7) +
+  facet_grid(form ~ route_group) +
+  scale_fill_manual(values = c(RTE = "#1A9850", Separation = "#4575B4")) +
+  labs(title = "Adjusted R² predicting air receiving yards: RTE vs. separation",
+       subtitle = "Every model includes routes run | dashed line = routes-only baseline",
+       x = NULL, y = "Adjusted R²", fill = NULL) +
+  theme_rte() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+ggsave(file.path(OUT_DIR, "air_yards_regression_adj_r2.png"), reg_plot, width = 11, height = 6)
+reg_plot
+```
+
+# 6. Follow-ups
+
+Added after the original analysis; nothing above this section was changed. These blocks reuse `plays`, `season_rte`, `split_half`, `assign_half()`, `summarize_season()`, `add_percentiles()`, `CFG`, `OUT_DIR`, `theme_rte()` and `RTE_PALETTE`, so run the chunks above first.
+
+```{r followup-setup}
+CFG_FU <- list(
+  min_targets_season = 10,  # 6b: WR needs >= this many targets in the route group (full season)
+  min_targets_half   = 5    # 6c: per-target outcome needs >= this many targets in EACH half
+)
+
+FEATURE_LABELS <- c(baseline = "baseline (no feature)", mRTE = "mRTE", aRTE = "aRTE", fRTE = "fRTE",
+                    separation = "separation", prior = "prior outcome (H1)")
+
+# Weighted Pearson correlation (weights = targets, so low-target WRs count less)
+wcor <- function(x, y, w) {
+  ok <- complete.cases(x, y, w)
+  if (sum(ok) < 3) return(NA_real_)
+  cov.wt(cbind(x[ok], y[ok]), wt = w[ok] / sum(w[ok]), cor = TRUE)$cor[1, 2]
+}
+
+# Leave-one-out RMSE via the hat-matrix shortcut. Works for lm() with or without weights
+# (residuals() are raw residuals, hatvalues() uses the weighted hat matrix);
+# the average is weighted by w so it matches how the model is fit.
+loo_rmse_w <- function(fit, w) {
+  e <- residuals(fit) / (1 - hatvalues(fit))
+  sqrt(weighted.mean(e^2, w))
+}
+```
+
+## 6a. Split-half reliability of the benchmarks: separation and air yards per route
+
+Same rules as section 2 (same halves, WRs need at least `min_routes_split` routes of the route group in each half, same `min_wr_corr` rule), so the n's match the RTE rows and the numbers are directly comparable. The RTE rows are taken from `split_half` above.
+
+```{r followup-benchmark-reliability}
+bench_split_half <- function(plays, cfg) {
+  halves <- assign_half(plays, cfg$split_method) %>%
+    group_by(nfl_id, player_name, route_group, half) %>%
+    summarize(separation        = median(separation, na.rm = TRUE),
+              air_yds_per_route = sum(air_gain) / n(),
+              routes            = n(), .groups = "drop") %>%
+    pivot_wider(names_from = half, values_from = c(separation, air_yds_per_route, routes),
+                names_glue = "{.value}_{half}") %>%
+    filter(routes_H1 >= cfg$min_routes_split, routes_H2 >= cfg$min_routes_split)
+
+  metrics <- c("separation", "air_yds_per_route")
+
+  map_dfr(cfg$route_groups, function(g) {
+    d <- halves %>% filter(route_group == g)
+    map_dfr(metrics, function(m) {
+      a  <- d[[paste0(m, "_H1")]]
+      b  <- d[[paste0(m, "_H2")]]
+      ok <- complete.cases(a, b)
+      tibble(route_group = g, metric = m, n = sum(ok),
+             r   = if (sum(ok) >= 3) cor(a[ok], b[ok]) else NA_real_,
+             rho = if (sum(ok) >= 3) cor(a[ok], b[ok], method = "spearman") else NA_real_)
+    })
+  }) %>%
+    mutate(r_spearman_brown = 2 * r / (1 + r)) %>%
+    filter(n >= cfg$min_wr_corr)
+}
+
+METRIC_LABELS <- c(mRTE = "mRTE", aRTE = "aRTE", fRTE = "fRTE",
+                   separation = "Separation", air_yds_per_route = "Air yds / route")
+
+reliability_all <- bind_rows(
+  split_half %>% select(route_group, metric, n, r, rho, r_spearman_brown),
+  bench_split_half(plays, CFG)
+)
+
+reliability_all %>%
+  mutate(across(c(r, rho, r_spearman_brown), ~ round(.x, 3)))
+```
+
+```{r followup-benchmark-reliability-plot}
+keep_rel <- CFG$route_groups[CFG$route_groups %in% reliability_all$route_group]
+
+reliability_plot <- reliability_all %>%
+  mutate(route_group = factor(route_group, levels = keep_rel),
+         metric      = factor(metric, levels = rev(names(METRIC_LABELS)),
+                              labels = rev(unname(METRIC_LABELS)))) %>%
+  ggplot(aes(route_group, metric, fill = r)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f\n(n = %d)", r, n)), size = 3.6, fontface = "bold") +
+  scale_fill_gradient2(low = RTE_PALETTE[1], mid = RTE_PALETTE[2], high = RTE_PALETTE[3],
+                       midpoint = 0, limits = c(-1, 1)) +
+  labs(title = "Split-half reliability: RTE vs. separation vs. air yards per route",
+       subtitle = paste0("Min ", CFG$min_routes_split, " routes of the route group in each half | ",
+                         if (CFG$split_method == "season") "league-wide season midpoint" else "per-WR median game"),
+       x = NULL, y = NULL, fill = "Split-half r") +
+  theme_rte()
+
+ggsave(file.path(OUT_DIR, "split_half_reliability_benchmarks.png"), reliability_plot, width = 8, height = 4.6)
+reliability_plot
+```
+
+## 6b. Air receiving yards per target (full season)
+
+Outcome = `air_yds / targets` in the route group (air yards are credited on catches, so this is the same quantity as "Air Rec Yds / Tgt" in the top-10 tables). Because the outcome is already a rate, routes run is not a control. Each model is `air_yds_per_target ~ feature` fit by **weighted** least squares (weights = targets, since a WR with 30 targets gives a much less noisy rate than one with 10), compared with an intercept-only baseline. Features are z-scored, so `beta_z` = change in air yards per target for +1 SD of the feature. `LOO skill` = 1 - (LOO MSE of the model / LOO MSE of the baseline); positive means the feature beats the baseline out of sample. WRs need `min_routes_model` routes and `min_targets_season` targets in the route group; groups with fewer than `min_n_model` WRs are skipped (expect Ultra-Long to drop out).
+
+```{r followup-ayt-models}
+fit_ayt_models <- function(d, g, cfg, fu) {
+  d <- d %>%
+    filter(targets >= fu$min_targets_season) %>%
+    mutate(ayt = air_yds / targets) %>%
+    drop_na(ayt, mRTE, aRTE, fRTE, separation) %>%
+    mutate(across(c(mRTE, aRTE, fRTE, separation), ~ as.numeric(scale(.x))))
+
+  if (nrow(d) < cfg$min_n_model) {
+    message("6b: skipping ", g, ": only ", nrow(d), " WRs with >= ", fu$min_targets_season,
+            " targets (need ", cfg$min_n_model, ").")
+    return(NULL)
+  }
+
+  base      <- lm(ayt ~ 1, data = d, weights = targets)
+  base_loo  <- loo_rmse_w(base, d$targets)
+
+  one <- function(feature) {
+    fit <- lm(as.formula(paste("ayt ~", feature)), data = d, weights = targets)
+    loo <- loo_rmse_w(fit, d$targets)
+    tibble(route_group = g, feature = feature, n = nobs(fit),
+           adj_r2 = summary(fit)$adj.r.squared,
+           loocv_rmse = loo, loo_skill = 1 - (loo / base_loo)^2,
+           p_vs_base = anova(base, fit)[2, "Pr(>F)"],
+           beta_z = unname(coef(fit)[feature]),
+           r_weighted = wcor(d[[feature]], d$ayt, d$targets))
+  }
+
+  bind_rows(
+    tibble(route_group = g, feature = "baseline", n = nobs(base),
+           adj_r2 = summary(base)$adj.r.squared, loocv_rmse = base_loo, loo_skill = 0,
+           p_vs_base = NA_real_, beta_z = NA_real_, r_weighted = NA_real_),
+    map_dfr(c("mRTE", "aRTE", "fRTE", "separation"), one)
+  )
+}
+
+ayt_results <- map_dfr(CFG$route_groups, function(g) {
+  fit_ayt_models(season_rte %>% filter(route_group == g, routes >= CFG$min_routes_model),
+                 g, CFG, CFG_FU)
+})
+stopifnot("6b: no route group had enough WRs" = nrow(ayt_results) > 0)
+
+ayt_results <- ayt_results %>%
+  mutate(route_group = factor(route_group, levels = CFG$route_groups))
+```
+
+```{r followup-ayt-table}
+ayt_gt <- ayt_results %>%
+  arrange(route_group, feature != "baseline", loocv_rmse) %>%
+  mutate(feature = unname(FEATURE_LABELS[feature])) %>%
+  select(route_group, feature, n, adj_r2, loocv_rmse, loo_skill, p_vs_base, beta_z, r_weighted) %>%
+  gt(groupname_col = "route_group") %>%
+  tab_header(
+    title    = md("**Predicting air receiving yards per target by route group**"),
+    subtitle = md(paste0("Weighted least squares (weights = targets) | min ", CFG_FU$min_targets_season,
+                         " targets in the route group | 2023"))
+  ) %>%
+  cols_label(feature = "Feature", n = "WRs", adj_r2 = "Adj R²", loocv_rmse = "LOO RMSE",
+             loo_skill = "LOO skill vs. baseline", p_vs_base = "p vs. baseline",
+             beta_z = "β (yds/tgt per SD)", r_weighted = "Weighted r") %>%
+  fmt_number(columns = c(adj_r2, loo_skill, r_weighted), decimals = 3) %>%
+  fmt_number(columns = c(loocv_rmse, beta_z), decimals = 2) %>%
+  fmt_number(columns = p_vs_base, decimals = 3) %>%
+  sub_missing(columns = everything(), missing_text = "—") %>%
+  data_color(columns = loo_skill, palette = RTE_PALETTE, domain = c(-0.1, 0.1), na_color = "#EEEEEE") %>%
+  opt_row_striping() %>%
+  tab_options(table.font.size = px(12), heading.title.font.size = px(16),
+              column_labels.font.weight = "bold", row_group.font.weight = "bold")
+
+gtsave(ayt_gt, filename = file.path(OUT_DIR, "air_yds_per_target_regression_table.png"))
+ayt_gt
+```
+
+```{r followup-ayt-scatter}
+ayt_long <- season_rte %>%
+  filter(routes >= CFG$min_routes_model, targets >= CFG_FU$min_targets_season) %>%
+  mutate(ayt = air_yds / targets) %>%
+  pivot_longer(c(mRTE, aRTE, fRTE), names_to = "metric", values_to = "rte") %>%
+  mutate(metric = factor(metric, levels = c("mRTE", "aRTE", "fRTE")))
+
+ayt_labels <- ayt_long %>%
+  group_by(route_group, metric) %>%
+  summarize(r = wcor(rte, ayt, targets), n = n(), .groups = "drop") %>%
+  mutate(label = sprintf("weighted r = %.2f\nn = %d", r, n))
+
+ayt_scatter <- ggplot(ayt_long, aes(rte, ayt)) +
+  geom_point(aes(size = targets), color = "#1A9850", alpha = 0.7) +
+  geom_smooth(aes(weight = targets), method = "lm", formula = y ~ x, se = TRUE,
+              color = "#D73027", fill = "#D73027", alpha = 0.15, linewidth = 0.9) +
+  geom_text(data = ayt_labels, aes(x = -Inf, y = Inf, label = label),
+            hjust = -0.1, vjust = 1.2, size = 3.2, fontface = "bold", inherit.aes = FALSE) +
+  facet_grid(metric ~ route_group, scales = "free_y") +
+  scale_x_continuous(limits = c(0, 100)) +
+  scale_size_continuous(range = c(1, 4), guide = "none") +
+  labs(title = "RTE vs. air receiving yards per target",
+       subtitle = paste0("Each point = one WR (size = targets) | min ", CFG$min_routes_model,
+                         " routes and ", CFG_FU$min_targets_season, " targets in the route group"),
+       x = "RTE percentile within route group", y = "Air receiving yards per target") +
+  theme_rte()
+
+ggsave(file.path(OUT_DIR, "air_yds_per_target_scatter.png"), ayt_scatter, width = 12, height = 8)
+ayt_scatter
+```
+
+## 6c. Out-of-sample: first-half features predicting second-half outcomes
+
+Features come only from the **first half** of the season; outcomes come only from the **second half**, so RTE and the outcome never share a play. To keep it strictly out of sample, RTE percentiles are recomputed from first-half plays only (the pooled-season ECDF in section 1 includes second-half plays). Three outcomes:
+
+* **Air yds per route (H2):** `ayr_h2 ~ feature_H1`, weighted by H2 routes, vs. an intercept-only baseline. This keeps usage (target rate) in the outcome, so a feature can earn skill by predicting who gets targeted as well as what happens on a target. No target minimum is needed.
+* **Air yds per target (H2):** `ayt_h2 ~ feature_H1`, weighted by H2 targets, vs. an intercept-only baseline. WRs need at least `min_targets_half` targets in each half.
+* **Total air yds (H2):** `air_yds_h2 ~ routes_h2 + feature_H1` vs. `air_yds_h2 ~ routes_h2`. This uses H2 routes as a volume control, so it is not a pure forecast.
+
+Features are `mRTE`, `aRTE`, `fRTE`, `separation` (all first half) and `prior`: the first-half value of the *outcome itself* (the usual persistence benchmark: does RTE tell you anything the WR's own past production doesn't?). WRs need `min_routes_split` routes of the route group in each half. Every model in a group/outcome is fit on the same WRs. `LOO skill` is computed across WRs (leave one WR out), relative to the baseline.
+
+```{r followup-oos-models}
+OOS_SPECS <- list(
+  ayr = list(label = "Air yds per route (H2)", y = "ayr_h2", controls = character(0),
+             prior = "ayr_h1", weight = "routes_h2", needs_targets = FALSE),
+  ayt = list(label = "Air yds per target (H2)", y = "ayt_h2", controls = character(0),
+             prior = "ayt_h1", weight = "targets_h2", needs_targets = TRUE),
+  air_yds = list(label = "Total air yds (H2)", y = "air_yds_h2", controls = "routes_h2",
+                 prior = "air_yds_h1", weight = NULL, needs_targets = FALSE)
+)
+
+build_oos_data <- function(plays, cfg) {
+  p  <- assign_half(plays, cfg$split_method)
+  p1 <- p %>% filter(half == "H1")
+  p2 <- p %>% filter(half == "H2")
+
+  h1 <- summarize_season(p1) %>%
+    add_percentiles(p1) %>%                      # percentiles from H1 plays only
+    transmute(nfl_id, player_name, route_group, routes_h1 = routes, mRTE, aRTE, fRTE,
+              separation, targets_h1 = targets, air_yds_h1 = air_yds)
+
+  h2 <- summarize_season(p2) %>%
+    transmute(nfl_id, route_group, routes_h2 = routes, targets_h2 = targets, air_yds_h2 = air_yds)
+
+  inner_join(h1, h2, by = c("nfl_id", "route_group")) %>%
+    filter(routes_h1 >= cfg$min_routes_split, routes_h2 >= cfg$min_routes_split) %>%
+    mutate(ayt_h1 = if_else(targets_h1 > 0, air_yds_h1 / targets_h1, NA_real_),
+           ayt_h2 = if_else(targets_h2 > 0, air_yds_h2 / targets_h2, NA_real_),
+           ayr_h1 = air_yds_h1 / routes_h1,
+           ayr_h2 = air_yds_h2 / routes_h2)
+}
+
+fit_oos_models <- function(d, g, spec, cfg, fu) {
+  if (spec$needs_targets) {
+    d <- d %>% filter(targets_h1 >= fu$min_targets_half, targets_h2 >= fu$min_targets_half)
+  }
+  feats <- c("mRTE", "aRTE", "fRTE", "separation", "prior")
+
+  d <- d %>%
+    mutate(prior = .data[[spec$prior]]) %>%
+    drop_na(all_of(c(spec$y, spec$controls, feats)))
+
+  if (nrow(d) < cfg$min_n_model) {
+    message("6c: skipping ", g, " / ", spec$label, ": only ", nrow(d), " WRs (need ", cfg$min_n_model, ").")
+    return(NULL)
+  }
+
+  d <- d %>% mutate(across(all_of(feats), ~ as.numeric(scale(.x))))
+  d$wt_ <- if (is.null(spec$weight)) 1 else d[[spec$weight]]
+
+  rhs  <- function(feature = NULL) {
+    terms <- c(spec$controls, feature)
+    if (length(terms) == 0) "1" else paste(terms, collapse = " + ")
+  }
+  make_fit <- function(feature = NULL) {
+    lm(as.formula(paste(spec$y, "~", rhs(feature))), data = d, weights = wt_)
+  }
+
+  base     <- make_fit()
+  base_loo <- loo_rmse_w(base, d$wt_)
+
+  one <- function(feature) {
+    fit <- make_fit(feature)
+    loo <- loo_rmse_w(fit, d$wt_)
+    tibble(route_group = g, outcome = spec$label, feature = feature, n = nobs(fit),
+           adj_r2 = summary(fit)$adj.r.squared,
+           loocv_rmse = loo, loo_skill = 1 - (loo / base_loo)^2,
+           p_vs_base = anova(base, fit)[2, "Pr(>F)"],
+           beta_z = unname(coef(fit)[feature]),
+           r_raw = wcor(d[[feature]], d[[spec$y]], d$wt_))
+  }
+
+  bind_rows(
+    tibble(route_group = g, outcome = spec$label, feature = "baseline", n = nobs(base),
+           adj_r2 = summary(base)$adj.r.squared, loocv_rmse = base_loo, loo_skill = 0,
+           p_vs_base = NA_real_, beta_z = NA_real_, r_raw = NA_real_),
+    map_dfr(feats, one)
+  )
+}
+
+oos_data <- build_oos_data(plays, CFG)
+oos_data %>% count(route_group, name = "WRs_with_both_halves")   # sample sizes before outcome-specific filters
+
+oos_results <- map_dfr(OOS_SPECS, function(spec) {
+  map_dfr(CFG$route_groups, function(g) {
+    fit_oos_models(oos_data %>% filter(route_group == g), g, spec, CFG, CFG_FU)
+  })
+})
+stopifnot("6c: no route group had enough WRs" = nrow(oos_results) > 0)
+
+oos_results <- oos_results %>%
+  mutate(route_group = factor(route_group, levels = CFG$route_groups))
+```
+
+```{r followup-oos-table}
+oos_gt <- oos_results %>%
+  mutate(group = paste0(route_group, " routes: ", outcome)) %>%
+  arrange(route_group, outcome, feature != "baseline", loocv_rmse) %>%
+  mutate(feature = unname(FEATURE_LABELS[feature])) %>%
+  select(group, feature, n, adj_r2, loocv_rmse, loo_skill, p_vs_base, beta_z, r_raw) %>%
+  gt(groupname_col = "group") %>%
+  tab_header(
+    title    = md("**First-half features predicting second-half outcomes**"),
+    subtitle = md("Features and RTE percentiles from H1 plays only; outcomes from H2 plays only | 2023")
+  ) %>%
+  cols_label(feature = "H1 feature", n = "WRs", adj_r2 = "Adj R²", loocv_rmse = "LOO RMSE",
+             loo_skill = "LOO skill vs. baseline", p_vs_base = "p vs. baseline",
+             beta_z = "β (per SD)", r_raw = "r with H2 outcome") %>%
+  fmt_number(columns = c(adj_r2, loo_skill, r_raw), decimals = 3) %>%
+  fmt_number(columns = c(loocv_rmse, beta_z), decimals = 2) %>%
+  fmt_number(columns = p_vs_base, decimals = 3) %>%
+  sub_missing(columns = everything(), missing_text = "—") %>%
+  data_color(columns = loo_skill, palette = RTE_PALETTE, domain = c(-0.1, 0.1), na_color = "#EEEEEE") %>%
+  opt_row_striping() %>%
+  tab_options(table.font.size = px(12), heading.title.font.size = px(16),
+              column_labels.font.weight = "bold", row_group.font.weight = "bold")
+
+gtsave(oos_gt, filename = file.path(OUT_DIR, "oos_h1_to_h2_table.png"))
+oos_gt
+```
+
+```{r followup-oos-plot}
+oos_plot <- oos_results %>%
+  filter(feature != "baseline") %>%
+  mutate(type = case_when(feature == "separation" ~ "Separation",
+                          feature == "prior" ~ "Prior outcome (H1)",
+                          TRUE ~ "RTE"),
+         feature = factor(feature, levels = c("mRTE", "aRTE", "fRTE", "separation", "prior"),
+                          labels = c("mRTE", "aRTE", "fRTE", "separation", "prior outcome"))) %>%
+  ggplot(aes(feature, loo_skill, fill = type)) +
+  geom_col(width = 0.7) +
+  geom_hline(yintercept = 0, linewidth = 0.7) +
+  facet_grid(outcome ~ route_group, scales = "free_y") +
+  scale_fill_manual(values = c(RTE = "#1A9850", Separation = "#4575B4", `Prior outcome (H1)` = "#999999")) +
+  labs(title = "Out-of-sample skill: first-half features predicting second-half outcomes",
+       subtitle = "Leave-one-WR-out skill vs. baseline (above 0 = beats the baseline out of sample)",
+       x = NULL, y = "LOO skill vs. baseline", fill = NULL) +
+  theme_rte() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+ggsave(file.path(OUT_DIR, "oos_h1_to_h2_skill.png"), oos_plot, width = 11, height = 8.5)
+oos_plot
+```
+
+## 6d. Usage check: is the negative Long relationship a target-volume effect?
+
+Two checks, run for every route group (Long is the one to read first):
+
+1. **Same WRs, different outcomes.** Correlate mRTE / aRTE / fRTE with target rate, air yards per target, air yards per route and total air yards on (a) every WR with at least `min_routes_model` routes in the route group, and (b) only the WRs used in 6b (also at least `min_targets_season` targets). The per-target models in 6b silently dropped low-target WRs, so if the sign flip were just selection, the total and per-route correlations would shrink toward zero on sample (b). If they stay negative there, the flip comes from the denominator, not from who was dropped.
+2. **RTE vs. target rate directly.** Target rate = targets / routes in the route group. Because `air yds / route = target rate x air yds / target`, the per-route correlation is made of a target-rate part and a per-target part. The usage story predicts: clearly negative with target rate, near zero per target, in between per route.
+
+```{r followup-usage-check}
+USAGE_SAMPLES <- c("All WRs (min routes)", "Same WRs as 6b (min targets)")
+USAGE_OUTCOMES <- c(target_rate = "Target rate", air_yds_per_target = "Air yds / target",
+                    air_yds_per_route = "Air yds / route", air_yds = "Total air yds")
+
+usage_corr <- function(season, cfg, fu) {
+  metrics <- c("mRTE", "aRTE", "fRTE")
+
+  base <- season %>%
+    filter(routes >= cfg$min_routes_model) %>%
+    mutate(target_rate        = targets / routes,
+           air_yds_per_target = if_else(targets > 0, air_yds / targets, NA_real_),
+           air_yds_per_route  = air_yds / routes)
+
+  samples <- setNames(
+    list(base, base %>% filter(targets >= fu$min_targets_season)),
+    USAGE_SAMPLES
+  )
+
+  imap_dfr(samples, function(d, sample_name) {
+    map_dfr(cfg$route_groups, function(g) {
+      dg <- d %>% filter(route_group == g)
+      map_dfr(names(USAGE_OUTCOMES), function(o) {
+        map_dfr(metrics, function(m) {
+          ok <- complete.cases(dg[[m]], dg[[o]])
+          tibble(sample = sample_name, route_group = g, outcome = USAGE_OUTCOMES[[o]],
+                 metric = m, n = sum(ok),
+                 r   = if (sum(ok) >= 3) cor(dg[[m]][ok], dg[[o]][ok]) else NA_real_,
+                 rho = if (sum(ok) >= 3) cor(dg[[m]][ok], dg[[o]][ok], method = "spearman") else NA_real_)
+        })
+      })
+    })
+  })
+}
+
+usage_results <- usage_corr(season_rte, CFG, CFG_FU) %>%
+  mutate(route_group = factor(route_group, levels = CFG$route_groups))
+
+# Long routes: Pearson r and Spearman rho, both samples
+usage_results %>%
+  filter(route_group == "Long") %>%
+  group_by(sample, outcome) %>%
+  mutate(n = min(n)) %>%
+  ungroup() %>%
+  select(sample, outcome, n, metric, r, rho) %>%
+  pivot_wider(names_from = metric, values_from = c(r, rho), names_glue = "{metric} {.value}") %>%
+  mutate(sample  = factor(sample, levels = USAGE_SAMPLES),
+         outcome = factor(outcome, levels = unname(USAGE_OUTCOMES))) %>%
+  arrange(sample, outcome) %>%
+  mutate(across(where(is.numeric) & !n, ~ round(.x, 2)))
+```
+
+```{r followup-usage-plot}
+usage_plot_df <- usage_results %>%
+  group_by(sample, route_group) %>%
+  mutate(n_panel = max(n)) %>%
+  ungroup() %>%
+  mutate(sample    = factor(sample, levels = USAGE_SAMPLES),
+         panel_chr = paste0(route_group, " | ", sample, " (n = ", n_panel, ")")) %>%
+  arrange(sample, route_group) %>%
+  mutate(panel   = factor(panel_chr, levels = unique(panel_chr)),
+         outcome = factor(outcome, levels = rev(unname(USAGE_OUTCOMES))),
+         metric  = factor(metric, levels = c("mRTE", "aRTE", "fRTE")))
+
+usage_heatmap <- ggplot(usage_plot_df, aes(metric, outcome, fill = r)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = if_else(is.na(r), "", sprintf("%.2f", r))), size = 3.4, fontface = "bold") +
+  scale_fill_gradient2(low = RTE_PALETTE[1], mid = RTE_PALETTE[2], high = RTE_PALETTE[3],
+                       midpoint = 0, limits = c(-1, 1), na.value = "#EEEEEE") +
+  facet_wrap(~ panel, ncol = 4) +
+  labs(title = "Correlation of RTE with usage and production",
+       subtitle = "Top row of panels: all WRs | bottom row: only the WRs used in the per-target models (6b)",
+       x = NULL, y = NULL, fill = "Pearson r") +
+  theme_rte()
+
+ggsave(file.path(OUT_DIR, "rte_usage_check_heatmap.png"), usage_heatmap, width = 14, height = 7)
+usage_heatmap
+```
+
+```{r followup-target-rate-scatter}
+tr_long <- season_rte %>%
+  filter(routes >= CFG$min_routes_model) %>%
+  mutate(target_rate = targets / routes) %>%
+  pivot_longer(c(mRTE, aRTE, fRTE), names_to = "metric", values_to = "rte") %>%
+  mutate(metric = factor(metric, levels = c("mRTE", "aRTE", "fRTE")))
+
+tr_labels <- tr_long %>%
+  group_by(route_group, metric) %>%
+  summarize(r = cor(rte, target_rate), n = n(), .groups = "drop") %>%
+  mutate(label = sprintf("r = %.2f\nn = %d", r, n))
+
+tr_plot <- ggplot(tr_long, aes(rte, target_rate)) +
+  geom_point(color = "#1A9850", alpha = 0.75, size = 2) +
+  geom_smooth(method = "lm", formula = y ~ x, se = TRUE, color = "#D73027",
+              fill = "#D73027", alpha = 0.15, linewidth = 0.9) +
+  geom_text(data = tr_labels, aes(x = -Inf, y = Inf, label = label),
+            hjust = -0.1, vjust = 1.2, size = 3.2, fontface = "bold", inherit.aes = FALSE) +
+  facet_grid(metric ~ route_group, scales = "free_y") +
+  scale_x_continuous(limits = c(0, 100)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "RTE vs. target rate by route group",
+       subtitle = paste0("Each point = one WR | target rate = targets / routes in the route group | min ",
+                         CFG$min_routes_model, " routes"),
+       x = "RTE percentile within route group", y = "Target rate") +
+  theme_rte()
+
+ggsave(file.path(OUT_DIR, "rte_vs_target_rate.png"), tr_plot, width = 12, height = 8)
+tr_plot
+```

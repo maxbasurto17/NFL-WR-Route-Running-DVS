@@ -35,6 +35,8 @@ CONFIG <- list(
   tracking_file = "full_data.csv",
   gam_file      = "gam_field_value_model.rds",
   envelope_file = "optimal_envelope_parameters.rds",  # looked for in data_dir, then working dir
+  # Incomplete-pass EP model, produced by Train_Incomplete_EP_Model.R (run that first)
+  ep_model_file = "incomplete_ep_model.rds",
 
   output_dir    = "~/Documents/Football_R/CMSAC--Field Value/PBP_Efficiency",
   output_pbp    = "all_wr_play_coverage_efficiency.csv",   # FINAL play-by-play file
@@ -49,7 +51,32 @@ CONFIG <- list(
   restart_workers_every = 20,     # restart worker processes every N WRs to release worker RAM
 
   # ---- field grid ----------------------------------------------------------
-  pitch = list(length = 120.0, width = 53.3, n_cols = 120, n_rows = 54),
+  # goal_line_x: x of the offense's goal line on the 0-120 standardized field
+  # (offense always moves toward +x). yardline_100 = goal_line_x - los_x_std.
+  pitch = list(length = 120.0, width = 53.3, n_cols = 120, n_rows = 54, goal_line_x = 110),
+
+  # ---- value of a throw (RTE) and plain field control (OFC) -----------------
+  # Per grid cell, with p = ppcf_att^completion_prob_power (completion weight):
+  #   value = p * sign(dEPA_c) * sqrt(|dEPA_c|)  +  (1 - p) * dEPA_inc
+  #   dEPA_c   = GAM post-pass EP - pre-snap EP         (completion branch, unchanged)
+  #   dEPA_inc = EP(state after an incompletion) - EP(current state)   (linear, no sqrt)
+  # Incomplete state: 1st-3rd down -> same spot / same distance, down + 1.
+  #                   4th down     -> see fourth_down below.
+  # NOTE: changing anything in `value` changes the output; re-run with resume = FALSE.
+  value = list(
+    include_incomplete    = TRUE,   # FALSE = legacy completion-only RTE
+    completion_prob_power = 2,      # legacy RTE used ppcf_att^2 as the completion weight
+    fourth_down           = "turnover_on_downs",  # or "zero" = no incomplete term on 4th down
+    ofc_power             = 1,      # OFC cell value = ppcf_att^ofc_power (1 = plain control)
+    ep_fn                 = NULL    # optional function(down, yards_to_go, yardline_100) -> EP
+                                    # (e.g. wrapping nflfastR). NULL = load ep_model_file.
+  ),
+
+  # Candidate column names in full_data.csv for the play state (first match wins)
+  state_cols = list(down = "down", yards_to_go = "yards_to_go"),
+
+  # Columns the output must contain (resume guard against an old-schema output file)
+  output_ofc_cols = c("peak_frame_ofc", "avg_play_ofc", "final_frame_ofc"),
 
   # ---- tracking columns to read (everything else is dropped to save RAM) ---
   tracking_cols = c(
@@ -81,7 +108,8 @@ resolve_paths <- function(cfg) {
   list(
     tracking = file.path(in_dir, cfg$tracking_file),
     gam      = file.path(in_dir, cfg$gam_file),
-    envelope = c(file.path(in_dir, cfg$envelope_file), cfg$envelope_file),
+    ep_model = file.path(in_dir, cfg$ep_model_file),
+    envelope =c(file.path(in_dir, cfg$envelope_file), cfg$envelope_file),
     pbp      = file.path(out_dir, cfg$output_pbp),
     frames   = file.path(out_dir, cfg$output_frames),
     progress = file.path(out_dir, cfg$progress_file)
@@ -145,16 +173,32 @@ load_inputs <- function(cfg, paths) {
   if (!file.exists(paths$tracking)) stop("Tracking file not found: ", paths$tracking)
   if (!file.exists(paths$gam))      stop("GAM model file not found: ", paths$gam)
 
+  # Fail fast (before the big read) if the incomplete-pass EP model is needed but missing
+  ep_fn <- if (isTRUE(cfg$value$include_incomplete)) resolve_ep_fn(cfg, paths) else NULL
+
   message("Reading tracking data...")
   raw <- readr::read_csv(
     paths$tracking,
-    col_select = dplyr::any_of(cfg$tracking_cols),
+    col_select = dplyr::any_of(c(cfg$tracking_cols, unlist(cfg$state_cols))),
     show_col_types = FALSE, progress = FALSE
   )
 
   required <- setdiff(cfg$tracking_cols, cfg$optional_cols)
   absent <- setdiff(required, names(raw))
   if (length(absent) > 0) stop("full_data.csv is missing columns: ", paste(absent, collapse = ", "))
+
+  # Down / yards-to-go -> standard names `down`, `yards_to_go` (needed for the incomplete term)
+  state_src <- resolve_state_cols(names(raw), cfg)
+  if (isTRUE(cfg$value$include_incomplete)) {
+    if (anyNA(state_src)) {
+      stop("include_incomplete = TRUE needs down and yards-to-go columns in full_data.csv. ",
+           "Looked for: down = {", paste(cfg$state_cols$down, collapse = ", "), "}, ",
+           "yards to go = {", paste(cfg$state_cols$yards_to_go, collapse = ", "), "}. ",
+           "Edit CONFIG$state_cols or set value$include_incomplete = FALSE.")
+    }
+    raw <- dplyr::rename(raw, down = dplyr::all_of(state_src[["down"]]),
+                              yards_to_go = dplyr::all_of(state_src[["yards_to_go"]]))
+  }
 
   # WR roster (as specified)
   all_wrs <- raw %>%
@@ -181,7 +225,23 @@ load_inputs <- function(cfg, paths) {
     dplyr::filter(!is.na(x_std), !is.na(y_std), !is.na(vx), !is.na(vy)) %>%
     dplyr::select(game_id, play_id, frame_id, nfl_id, player_side, is_qb,
                   x_std, y_std, s, vx, vy, vmax, acceleration,
-                  los_x_std, ball_land_y_std, expected_points, dropback_distance)
+                  los_x_std, ball_land_y_std, expected_points, dropback_distance,
+                  dplyr::any_of(c("down", "yards_to_go")))
+
+  # Per-play value of an incompletion (one number per play; same for every grid cell,
+  # because an incompletion always returns the ball to the line of scrimmage).
+  if (isTRUE(cfg$value$include_incomplete)) {
+    play_state <- build_play_state(tracking, cfg)
+    play_state <- compute_incomplete_epa(play_state, ep_fn, cfg$value$fourth_down)
+    tracking <- tracking %>%
+      dplyr::left_join(play_state[, c("game_id", "play_id", "epa_incomplete")],
+                       by = c("game_id", "play_id")) %>%
+      dplyr::select(-dplyr::any_of(c("down", "yards_to_go")))
+    rm(play_state, ep_fn)
+  } else {
+    tracking$epa_incomplete <- 0
+    tracking <- dplyr::select(tracking, -dplyr::any_of(c("down", "yards_to_go")))
+  }
 
   # Which plays each WR appears in (pre_pass)
   play_index <- tracking %>%
@@ -192,6 +252,116 @@ load_inputs <- function(cfg, paths) {
   invisible(gc(verbose = FALSE))
 
   list(tracking = tracking, play_index = play_index, all_wrs = all_wrs)
+}
+
+
+# =============================================================================
+# 2b. VALUE OF AN INCOMPLETE PASS (play-level, computed once)
+# =============================================================================
+
+resolve_state_cols <- function(raw_names, cfg) {
+  pick <- function(cands) {
+    hit <- cands[cands %in% raw_names]
+    if (length(hit) > 0) hit[1] else NA_character_
+  }
+  c(down = pick(cfg$state_cols$down), yards_to_go = pick(cfg$state_cols$yards_to_go))
+}
+
+# One row per play: down, distance, spot, pre-snap EP.
+build_play_state <- function(tracking, cfg) {
+  tracking %>%
+    dplyr::select(game_id, play_id, down, yards_to_go, los_x_std, expected_points) %>%
+    dplyr::distinct(game_id, play_id, .keep_all = TRUE) %>%
+    dplyr::mutate(yardline_100 = pmin(pmax(cfg$pitch$goal_line_x - los_x_std, 1), 99))
+}
+
+# EP(down, yards to go, yardline_100): trained and validated in
+# Train_Incomplete_EP_Model.R, loaded here. Only DIFFERENCES of this model enter
+# the output (next state - current state), so its overall bias cancels.
+# The feature construction below must match the trainer (it is stored in the
+# saved object as `yd_cap`).
+load_ep_model <- function(path) {
+  if (!file.exists(path)) {
+    stop("Incomplete-pass EP model not found: ", path,
+         "\n  Run Train_Incomplete_EP_Model.R first (or supply CONFIG$value$ep_fn).")
+  }
+  obj <- readRDS(path)
+  if (!all(c("model", "yd_cap") %in% names(obj))) {
+    stop("Unexpected format in ", path, " (expected a list with `model` and `yd_cap`).")
+  }
+  message(sprintf("EP model: %s (trained %s on %d plays; CV RMSE %.3f)", path,
+                  obj$trained_at, obj$n_train, obj$cv_rmse))
+  obj
+}
+
+make_ep_fn <- function(ep_obj) {
+  function(down, yards_to_go, yardline_100) {
+    yl <- pmin(pmax(yardline_100, 1), 99)
+    nd <- data.frame(down_f = factor(down, levels = 1:4),
+                     yardline_100 = yl,
+                     yd = pmin(pmax(yards_to_go, 1), yl, ep_obj$yd_cap))
+    as.numeric(predict(ep_obj$model, newdata = nd, type = "response"))
+  }
+}
+
+resolve_ep_fn <- function(cfg, paths) {
+  if (is.function(cfg$value$ep_fn)) {
+    message("EP model: user-supplied ep_fn")
+    return(cfg$value$ep_fn)
+  }
+  make_ep_fn(load_ep_model(paths$ep_model))
+}
+
+# dEPA if the pass is NOT completed = EP(next state) - EP(current state).
+#   1st-3rd down: same spot, same distance, down + 1.
+#   4th down "turnover_on_downs": defense takes over at the spot, 1st & 10
+#     (goal-to-go if inside the 10): EP_next = -EP_defense(1st, min(10, yds to goal), 100 - yardline_100).
+#   4th down "zero": no incomplete term.
+compute_incomplete_epa <- function(play_state, ep_fn, fourth_down = "turnover_on_downs") {
+  n  <- nrow(play_state)
+  ok <- !is.na(play_state$down) & play_state$down %in% 1:4 &
+        !is.na(play_state$yards_to_go) & !is.na(play_state$yardline_100)
+
+  ep_now  <- ep_fn(play_state$down, play_state$yards_to_go, play_state$yardline_100)
+  ep_next <- rep(NA_real_, n)
+
+  d123 <- ok & play_state$down <= 3
+  if (any(d123)) {
+    ep_next[d123] <- ep_fn(play_state$down[d123] + 1, play_state$yards_to_go[d123],
+                           play_state$yardline_100[d123])
+  }
+
+  d4 <- ok & play_state$down == 4
+  if (any(d4)) {
+    if (identical(fourth_down, "turnover_on_downs")) {
+      opp_yl <- 100 - play_state$yardline_100[d4]
+      ep_next[d4] <- -ep_fn(rep(1, sum(d4)), pmin(10, opp_yl), opp_yl)
+    } else {
+      ep_next[d4] <- ep_now[d4]   # -> incomplete term = 0
+    }
+  }
+
+  out <- ep_next - ep_now
+  n_missing <- sum(is.na(out))
+  if (n_missing > 0) {
+    warning(n_missing, " plays have no usable down / distance / spot; their incomplete term is set to 0.",
+            call. = FALSE)
+    out[is.na(out)] <- 0
+  }
+  message(sprintf("Incomplete-pass dEPA: mean %.3f | by down: %s", mean(out),
+                  paste(sprintf("%d=%.2f", 1:4,
+                                vapply(1:4, function(k) mean(out[play_state$down %in% k]), numeric(1))),
+                        collapse = ", ")))
+  play_state$epa_incomplete <- out
+  play_state
+}
+
+# Value of throwing to one cell (vectorized). Completion branch is the legacy RTE term.
+compute_cell_value <- function(ppcf_att, epa_complete, epa_incomplete, value_cfg) {
+  w <- ppcf_att^value_cfg$completion_prob_power
+  complete_term <- (sign(epa_complete) * sqrt(abs(epa_complete))) * w
+  if (!isTRUE(value_cfg$include_incomplete)) return(complete_term)
+  return(complete_term + pmax(1 - w, 0) * sign(epa_incomplete) * sqrt(abs(epa_incomplete)))
 }
 
 
@@ -427,6 +597,7 @@ compute_frame_cells <- function(fd, wr_id, gx, gy, envelope_model) {
     in_target_zone = TRUE,
     ball_land_y_std = target$ball_land_y_std[1],
     expected_points = target$expected_points[1],
+    epa_incomplete = target$epa_incomplete[1],
     los_x_std = los_x,
     dropback_distance = target$dropback_distance[1],
     pass_depth = zx - los_x
@@ -434,7 +605,7 @@ compute_frame_cells <- function(fd, wr_id, gx, gy, envelope_model) {
 }
 
 # Whole play: pitch control for every frame -> one GAM prediction -> frame summary.
-process_play <- function(play_data, wr_id, envelope_model, gam_path, pitch) {
+process_play <- function(play_data, wr_id, envelope_model, gam_path, pitch, value_cfg) {
   grid <- build_nfl_grid(pitch$length, pitch$width, pitch$n_cols, pitch$n_rows)
   gx <- as.vector(grid$x)
   gy <- as.vector(grid$y)
@@ -468,16 +639,19 @@ process_play <- function(play_data, wr_id, envelope_model, gam_path, pitch) {
 
   frames <- cells %>%
     dplyr::mutate(
-      epa        = pred_post_epa - expected_points,
-      raw_eff    = (sign(epa) * sqrt(abs(epa))) * (ppcf_att^2),
-      # zero-out cells behind the QB dropback position
-      efficiency = ifelse((pass_depth + dropback_distance) <= 0, 0, raw_eff)
+      epa_complete = pred_post_epa - expected_points,
+      cell_value   = compute_cell_value(ppcf_att, epa_complete, epa_incomplete, value_cfg),
+      # zero-out cells behind the QB dropback position (same mask for RTE and OFC)
+      behind_qb  = (pass_depth + dropback_distance) <= 0,
+      efficiency = ifelse(behind_qb, 0, cell_value),
+      ofc_cell   = ifelse(behind_qb, 0, ppcf_att^value_cfg$ofc_power)
     ) %>%
     dplyr::group_by(game_id, play_id, frame_id) %>%
     dplyr::summarize(
       total_wr_control = sum(ppcf_att, na.rm = TRUE),
       mean_wr_control  = mean(ppcf_att, na.rm = TRUE),
       frame_efficiency = sum(efficiency, na.rm = TRUE),
+      frame_ofc        = sum(ofc_cell, na.rm = TRUE),
       pass_depth       = dplyr::first(pass_depth),
       .groups = "drop"
     )
@@ -485,9 +659,9 @@ process_play <- function(play_data, wr_id, envelope_model, gam_path, pitch) {
   list(frames = frames, n_errors = n_errors, first_error = first_error)
 }
 
-safe_process_play <- function(play_data, wr_id, envelope_model, gam_path, pitch) {
+safe_process_play <- function(play_data, wr_id, envelope_model, gam_path, pitch, value_cfg) {
   tryCatch(
-    process_play(play_data, wr_id, envelope_model, gam_path, pitch),
+    process_play(play_data, wr_id, envelope_model, gam_path, pitch, value_cfg),
     error = function(e) list(frames = NULL, n_errors = 1L, first_error = conditionMessage(e))
   )
 }
@@ -505,6 +679,9 @@ summarize_play_level <- function(frame_level) {
       avg_play_efficiency    = mean(frame_efficiency, na.rm = TRUE),
       peak_frame_efficiency  = max(frame_efficiency, na.rm = TRUE),
       final_frame_efficiency = dplyr::last(frame_efficiency),
+      avg_play_ofc           = mean(frame_ofc, na.rm = TRUE),
+      peak_frame_ofc         = max(frame_ofc, na.rm = TRUE),
+      final_frame_ofc        = dplyr::last(frame_ofc),
       total_frames_analyzed  = dplyr::n_distinct(frame_id),
       .groups = "drop"
     )
@@ -527,6 +704,7 @@ process_wr <- function(wr_id, wr_name, tracking, play_index, envelope_model, pat
     plays, safe_process_play,
     wr_id = wr_id, envelope_model = envelope_model,
     gam_path = paths$gam, pitch = cfg$pitch,
+    value_cfg = cfg$value[c("include_incomplete", "completion_prob_power", "ofc_power")],
     .options = furrr::furrr_options(packages = c("dplyr", "mgcv"))
   )
   rm(plays)
@@ -564,6 +742,19 @@ restart_workers <- function(n_workers) {
   if (n_workers > 1) future::plan(future::multisession, workers = n_workers)
 }
 
+# Appending new columns to an old-schema CSV would silently corrupt it.
+check_output_schema <- function(paths, cfg) {
+  if (!isTRUE(cfg$resume) || !file.exists(paths$pbp)) return(invisible(TRUE))
+  hdr <- names(readr::read_csv(paths$pbp, n_max = 0, show_col_types = FALSE, progress = FALSE))
+  miss <- setdiff(cfg$output_ofc_cols, hdr)
+  if (length(miss) > 0) {
+    stop("Existing output (", paths$pbp, ") was made by an older version of this script ",
+         "(missing: ", paste(miss, collapse = ", "), "). Set CONFIG$resume = FALSE to start fresh ",
+         "(this deletes the old output and progress log), or move those files first.")
+  }
+  invisible(TRUE)
+}
+
 read_completed_ids <- function(progress_path) {
   if (!file.exists(progress_path)) return(numeric(0))
   readr::read_csv(progress_path, col_select = dplyr::all_of("nfl_id"),
@@ -579,6 +770,7 @@ main <- function(cfg = CONFIG) {
   if (!isTRUE(cfg$resume)) {
     unlink(c(paths$pbp, paths$frames, paths$progress))
   }
+  check_output_schema(paths, cfg)
 
   envelope_model <- load_envelope_model(paths$envelope)
   inputs <- load_inputs(cfg, paths)

@@ -1305,3 +1305,141 @@ key_plot
 
 ```{r}
 ```
+
+# 7. Peak vs. average residuals: who is spiky, who is sustained?
+
+For each receiver, the **residual** is the season peak percentile minus the season average percentile: `mRTE - aRTE` and `mOFC - aOFC`. A large positive residual means the receiver's best moment on a route is much better than his typical moment (a spiky threat that appears briefly). A large negative residual means he is comparatively better on average than at his peak (a threat that is sustained, but rarely peaks).
+
+Receivers are scored across all route groups, so the minimum is **200 routes in total** (`CFG_RESID$min_routes`). Percentiles are the within-route-group percentiles from `season_rte`, combined into one number per receiver with a **routes-weighted average** across his route groups. That keeps the residual from being driven by route mix (Long routes are not compared to Short ones). The residual is in percentile points. Four tables: top 10 and bottom 10 for RTE, and the same two for OFC.
+
+```{r residual-setup}
+CFG_RESID <- list(min_routes = 200, n = 10)
+
+resid_df <- season_rte %>%
+  group_by(nfl_id, player_name) %>%
+  summarize(across(all_of(FIELD_METRICS), ~ weighted.mean(.x, routes)),   # uses per-group routes
+            targets = sum(targets),
+            routes  = sum(routes),
+            .groups = "drop") %>%
+  mutate(resid_RTE = mRTE - aRTE,
+         resid_OFC = mOFC - aOFC) %>%
+  filter(routes >= CFG_RESID$min_routes)
+
+message(nrow(resid_df), " WRs with at least ", CFG_RESID$min_routes, " routes across the route groups.")
+
+# distribution check
+resid_df %>%
+  summarize(across(c(resid_RTE, resid_OFC),
+                   list(min = min, p25 = ~ quantile(.x, 0.25), median = median,
+                        p75 = ~ quantile(.x, 0.75), max = max),
+                   .names = "{.col}_{.fn}")) %>%
+  pivot_longer(everything(), names_to = c("metric", "stat"), names_pattern = "resid_(RTE|OFC)_(.*)") %>%
+  pivot_wider(names_from = stat, values_from = value) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 1)))
+```
+
+```{r residual-tables}
+make_resid_table <- function(family = c("RTE", "OFC"), end = c("top", "bottom"),
+                             d = resid_df, cfg = CFG_RESID, save = TRUE) {
+  family <- match.arg(family)
+  end    <- match.arg(end)
+  m   <- paste0("m", family)
+  a   <- paste0("a", family)
+  res <- paste0("resid_", family)
+
+  tab <- d %>%
+    arrange(if (end == "top") desc(.data[[res]]) else .data[[res]]) %>%
+    slice_head(n = cfg$n) %>%
+    select(player_name, routes, targets, pctl_m = all_of(m), pctl_a = all_of(a), resid = all_of(res))
+
+  lim <- max(abs(tab$resid))
+  what <- if (end == "top") "largest positive residuals: peak well above average (spiky)"
+          else              "largest negative residuals: average closest to or above peak (sustained)"
+
+  gt_tbl <- tab %>%
+    gt() %>%
+    tab_header(
+      title    = md(paste0("**", if (end == "top") "Top " else "Bottom ", cfg$n, ": ", m, " - ", a,
+                           " residual (2023)**")),
+      subtitle = md(paste0(what, " | percentile points, routes-weighted across route groups | min ",
+                           cfg$min_routes, " routes"))
+    ) %>%
+    cols_label(player_name = "Player", routes = "Routes", targets = "Targets",
+               pctl_m = m, pctl_a = a, resid = paste0(m, " - ", a)) %>%
+    fmt_number(columns = c(pctl_m, pctl_a), decimals = 1) %>%
+    fmt_number(columns = resid, decimals = 1, force_sign = TRUE) %>%
+    fmt_number(columns = c(routes, targets), decimals = 0) %>%
+    data_color(columns = c(pctl_m, pctl_a), palette = RTE_PALETTE, domain = c(0, 100), na_color = "#EEEEEE") %>%
+    data_color(columns = resid, palette = RTE_PALETTE, domain = c(-lim, lim), na_color = "#EEEEEE") %>%
+    cols_align(align = "left", columns = player_name) %>%
+    cols_align(align = "center", columns = c(routes, targets, pctl_m, pctl_a, resid)) %>%
+    opt_row_striping() %>%
+    tab_options(table.font.size = px(13), heading.title.font.size = px(16),
+                column_labels.font.weight = "bold")
+
+  if (save) gtsave(gt_tbl, filename = file.path(OUT_DIR,
+                   paste0("residual_", m, "_minus_", a, "_", end, cfg$n, ".png")))
+  gt_tbl
+}
+
+make_resid_table("RTE", "top")
+make_resid_table("RTE", "bottom")
+make_resid_table("OFC", "top")
+make_resid_table("OFC", "bottom")
+```
+
+
+## 7b. Peak vs. average field control: mOFC against aOFC
+
+Each point is one receiver with at least `CFG_RESID$min_routes` (200) routes in total, using the same routes-weighted combination of route-group percentiles as above (`resid_df`). The axes are zoomed to the 25th-75th percentiles (receivers outside that window are not drawn; the chunk reports how many). The dotted line is y = x: receivers on it have peak and average at the same percentile. Above the line the peak percentile exceeds the average percentile (labeled "Route runners"); below it the average exceeds the peak ("Speed separators"). The residual tables above rank how far each receiver is from the line.
+
+```{r ofc-peak-vs-avg-scatter}
+OFC_HIGHLIGHT <- c("DK Metcalf", "Amon-Ra St. Brown", "Brandin Cooks", "Garrett Wilson")  # names as in the dataset
+
+missing_hl <- setdiff(OFC_HIGHLIGHT, resid_df$player_name)
+if (length(missing_hl) > 0) {
+  message("Not found among WRs with >= ", CFG_RESID$min_routes, " routes (check spelling / route minimum): ",
+          paste(missing_hl, collapse = ", "))
+}
+
+ofc_pts <- resid_df %>% mutate(highlight = player_name %in% OFC_HIGHLIGHT)
+ofc_hl  <- ofc_pts %>% filter(highlight)
+
+AXIS_LIM <- c(25, 75)   # zoom window (percentiles) for both axes
+
+outside <- ofc_pts %>% filter(!between(aOFC, AXIS_LIM[1], AXIS_LIM[2]) | !between(mOFC, AXIS_LIM[1], AXIS_LIM[2]))
+message(nrow(outside), " of ", nrow(ofc_pts), " WRs fall outside the ", AXIS_LIM[1], "-", AXIS_LIM[2],
+        " window and are not shown",
+        if (any(outside$highlight)) paste0(" (including highlighted: ", paste(outside$player_name[outside$highlight], collapse = ", "), ")") else "",
+        ".")
+
+label_layer <- if (requireNamespace("ggrepel", quietly = TRUE)) {
+  ggrepel::geom_label_repel(data = ofc_hl, aes(label = player_name), fontface = "bold", size = 3.6,
+                            box.padding = 0.7, min.segment.length = 0, max.overlaps = Inf,
+                            color = "black", fill = "white")
+} else {
+  geom_text(data = ofc_hl, aes(label = player_name), fontface = "bold", size = 3.6, vjust = -1)
+}
+
+ofc_scatter <- ggplot(ofc_pts, aes(aOFC, mOFC)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", linewidth = 0.8) +
+  geom_point(data = filter(ofc_pts, !highlight), color = "grey60", alpha = 0.7, size = 2) +
+  geom_point(data = ofc_hl, color = FAMILY_COLORS[["OFC"]], size = 4) +
+  label_layer +
+  annotate("text", x = AXIS_LIM[1] + 1, y = AXIS_LIM[2] - 1, label = "Route runners",
+           hjust = 0, vjust = 1, size = 5, fontface = "bold", color = "grey35") +
+  annotate("text", x = AXIS_LIM[2] - 1, y = AXIS_LIM[1] + 1, label = "Speed separators",
+           hjust = 1, vjust = 0, size = 5, fontface = "bold", color = "grey35") +
+  scale_x_continuous(breaks = seq(AXIS_LIM[1], AXIS_LIM[2], 12.5)) +
+  scale_y_continuous(breaks = seq(AXIS_LIM[1], AXIS_LIM[2], 12.5)) +
+  coord_fixed(xlim = AXIS_LIM, ylim = AXIS_LIM) +     # zooms without dropping data from the geoms
+  labs(title = "Peak vs. average offensive field control (mOFC vs. aOFC)",
+       subtitle = paste0("Each point = one WR with at least ", CFG_RESID$min_routes,
+                         " routes | percentiles within route group, routes-weighted | dotted line: y = x"),
+       x = "aOFC (average-play field control percentile)",
+       y = "mOFC (peak-frame field control percentile)") +
+  theme_rte()
+
+ggsave(file.path(OUT_DIR, "mOFC_vs_aOFC_scatter.png"), ofc_scatter, width = 9, height = 9)
+ofc_scatter
+```

@@ -9,8 +9,8 @@ library(tidyverse)
 library(ggplot2)
 
 # 1. Load data
-full_df <- read_csv("~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/full_data.csv")
-all_grid <- read_csv("~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/Methodology/Final Metrics Computation/Mike_Evans_grid_cov_2games.csv")
+full_df <- read_csv("~/Documents/Football_R/CMSAC--Field Value/full_data.csv")
+all_grid <- read_csv("~/Documents/Football_R/CMSAC--Field Value/Analysis/Mike_Evans_grid_efficiency.csv")
 
 ```
 
@@ -90,8 +90,8 @@ p <- ggplot() +
   # Coverage Efficiency Heatmap Layer (na.value hides background tiles)
   geom_tile(data = static_surface, aes(x = x, y = y, fill = efficiency), alpha = 0.75) +
   scale_fill_gradient2(
-    low = "white", mid = "lightpink", high = "#dc2626", 
-    midpoint = 0.25, limits = c(0, 0.5), name = "Route Threat\nEfficiency",
+    low = "blue", mid = "white", high = "#dc2626", 
+    midpoint = 0.25, limits = c(-3, 3), name = "Route Threat\nEfficiency",
     na.value = "transparent"
   ) +
   
@@ -126,7 +126,7 @@ p <- ggplot() +
 p
 
 ggsave(
-  filename = "~/Documents/Sports Analytics/NFL-WR-Route-Running-DVS-main/Plots/Mike_Evans_TD_DVS_plot.png",
+  filename = "~/Documents/Football_R/CMSAC--Field Value/Analysis/Mike_Evans_TD_DVS_plot.png",
   plot = p,
   width = 8.5,
   height = 7.5,

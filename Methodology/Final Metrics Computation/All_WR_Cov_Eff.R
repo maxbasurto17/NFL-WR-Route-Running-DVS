@@ -44,7 +44,7 @@ CONFIG <- list(
   progress_file = "all_wr_progress.csv",                   # one row per finished WR
 
   # ---- behavior ------------------------------------------------------------
-  save_frame_level      = FALSE,  # also append frame-by-frame rows to output_frames
+  save_frame_level      = TRUE,  # also append frame-by-frame rows to output_frames
   resume                = TRUE,   # skip WRs already in progress_file; FALSE = start fresh (deletes outputs)
   wr_limit              = NULL,   # e.g. 3 to test on the first 3 WRs; NULL = all
   n_workers             = 8,      # 1 = no parallelism
@@ -65,7 +65,7 @@ CONFIG <- list(
   # NOTE: changing anything in `value` changes the output; re-run with resume = FALSE.
   value = list(
     include_incomplete    = TRUE,   # FALSE = legacy completion-only RTE
-    completion_prob_power = 2,      # legacy RTE used ppcf_att^2 as the completion weight
+    completion_prob_power = 1,      # legacy RTE used ppcf_att^2 as the completion weight
     fourth_down           = "turnover_on_downs",  # or "zero" = no incomplete term on 4th down
     ofc_power             = 1,      # OFC cell value = ppcf_att^ofc_power (1 = plain control)
     ep_fn                 = NULL    # optional function(down, yards_to_go, yardline_100) -> EP
@@ -359,9 +359,9 @@ compute_incomplete_epa <- function(play_state, ep_fn, fourth_down = "turnover_on
 # Value of throwing to one cell (vectorized). Completion branch is the legacy RTE term.
 compute_cell_value <- function(ppcf_att, epa_complete, epa_incomplete, value_cfg) {
   w <- ppcf_att^value_cfg$completion_prob_power
-  complete_term <- (sign(epa_complete) * sqrt(abs(epa_complete))) * w
+  complete_term <- epa_complete * w
   if (!isTRUE(value_cfg$include_incomplete)) return(complete_term)
-  return(complete_term + pmax(1 - w, 0) * sign(epa_incomplete) * sqrt(abs(epa_incomplete)))
+  return(complete_term + (pmax(1 - w, 0)^2) * 0.75*epa_incomplete)
 }
 
 

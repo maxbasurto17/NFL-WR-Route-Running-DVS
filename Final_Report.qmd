@@ -123,14 +123,14 @@ By combining this continuous $xEPA$ surface with the kinematic pitch control mat
 
 Figure 2 visualizes the xEPA for completed pass plays starting from the opponent’s 30 yardline. Intuitively, the xEPA increases gradually as the pass length increases, and horizontal change does not materially impact the xEPA of a pass. 
 
-## 3.3 Field Value Model -- Incompletions ($\Delta EPA_{inc}$)
+## 3.3 Field Value Model -- Incompletions ($xEPA_{inc}$)
 
 A completion is only one of the two ways a throw can end, so the value of a receiver's space cannot be judged by the completion outcome alone. If a receiver controls a cell that is worth a lot when caught but is rarely won, the cost of the pass falling incomplete should count against it. The incompletion model quantifies that cost as the change in Expected Points ($EP$) when the pass is not completed.
 
 ### Play-Level Value of an Incompletion
 
-Unlike the completion value in Section 3.2, the value of an incompletion does not depend on where the ball lands. An incomplete pass returns the offense to the line of scrimmage with a new down, so the outcome depends only on the game state at the snap: down, distance, and field position. For that reason $\Delta EPA_{inc}$ is a single number for each play that is applied identically to every cell of the grid. It is defined as the difference between the $EP$ of the state after the incompletion and the $EP$ of the current state:
-$$\Delta EPA_{inc} = EP(\text{state after incompletion}) - EP(\text{current state})$$
+Unlike the completion value in Section 3.2, the value of an incompletion does not depend on where the ball lands. An incomplete pass returns the offense to the line of scrimmage with a new down, so the outcome depends only on the game state at the snap: down, distance, and field position. For that reason $xEPA_{inc}$ is a single number for each play that is applied identically to every cell of the grid. It is defined as the difference between the $EP$ of the state after the incompletion and the $EP$ of the current state:
+$$xEPA_{inc} = EP(\text{state after incompletion}) - EP(\text{current state})$$
 The state after an incompletion depends on the down:
 
 - **1st through 3rd down**: The ball stays at the same spot with the same distance to go, and the down advances by one.
@@ -142,7 +142,7 @@ Both terms of the difference require an $EP$ estimate for an arbitrary combinati
 $$\mathbb{E}[EP] = \beta_0 + \beta_{down} + f_{down}(yl) + g_{down}(yd)$$
 Where $yl$ is the distance to the opponent's goal line (110 minus the line of scrimmage on our 120-yard field, bounded between 1 and 99) and $yd$ is yards to go, which is bounded to be at least 1 and no more than the distance to the goal line or 25 yards. The yardline smooths use basis dimension $k=8$, the yards-to-go smooths use $k=5$, and the model is fit with REML.
 
-To check the model, we use 5-fold cross validation with folds grouped by game, so that no play from a held-out game is ever used to train the model that predicts it. Out-of-fold accuracy (RMSE, MAE, and $R^2$) is compared to a baseline that predicts the mean $EP$ of each down. Because only differences between two $EP$ predictions enter $\Delta EPA_{inc}$, any overall bias in the model cancels out, and what matters is that the model orders states correctly: an incompletion should almost always cost the offense expected points. We check this directly by computing the share of plays on each down for which the implied $\Delta EPA_{inc}$ is negative. One limitation is that the 3rd-to-4th down step is partially an extrapolation, since 4th downs in the data are mostly ones where the team chose to go for it and are therefore concentrated at short distances.
+To check the model, we use 5-fold cross validation with folds grouped by game, so that no play from a held-out game is ever used to train the model that predicts it. Out-of-fold accuracy (RMSE, MAE, and $R^2$) is compared to a baseline that predicts the mean $EP$ of each down. Because only differences between two $EP$ predictions enter $xEPA_{inc}$, any overall bias in the model cancels out, and what matters is that the model orders states correctly: an incompletion should almost always cost the offense expected points. We check this directly by computing the share of plays on each down for which the implied $xEPA_{inc}$ is negative. One limitation is that the 3rd-to-4th down step is partially an extrapolation, since 4th downs in the data are mostly ones where the team chose to go for it and are therefore concentrated at short distances.
 
 ## 3.4 Reasonable Pass Bounds
 
@@ -197,7 +197,7 @@ Dangerous Viable Space (DVS) represents the mathematical synthesis of the kinema
 This framework forgoes the direct linear multiplication of spatial Expected Points Added ($xEPA$) and offensive Pitch Control Probability ($PPCF_{att}$) utilized in prior models such as Illuminating the Defense (Subbaiah et al., 2021). Instead, the model applies a specific non-linear transformation to better capture the risk-reward dynamics of NFL passing windows. The raw spatial efficiency at each grid cell is modeled as:
 
   $$p(x, y) = PPCF_{att}(x, y)$$
-  $$DVS(x, y) = p \cdot xEPA_c + (1 - p)^2 \cdot 0.75 \cdot \Delta EPA_{inc}$$
+  $$DVS(x, y) = p \cdot xEPA_c + (1 - p)^2 \cdot 0.75 \cdot xEPA_{inc}$$
 
 Here $p$ is the weight placed on the completion outcome, and the remaining $(1 - p)$ is placed on the incompletion outcome, whose value $\Delta EPA_{inc}$ (Section 3.3) is the same for every cell on a given play. Squaring the defensive control probability ($1-p$) and scaling down the incompletion penalty shifts additional weight to the offense, whose control is slightly dampened by the model due to the defensive advantage adjustment mentioned earlier. This transformation strictly rewards receivers who establish dominant leverage in positive-value areas rather than receivers who are in high-value locations with little spatial control. To ensure the metric strictly evaluates downfield route-running threat, DVS is subjected to rigid spatial masking. Any calculated efficiency value located behind the quarterback's dropback position is zeroed out, preventing lateral or backward movement behind the line of scrimmage from artificially deflating a receiver's spatial score.
 
